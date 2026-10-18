@@ -465,6 +465,56 @@ describe("run", () => {
     }
   });
 
+  test("a first acquire that reaches the server only after run gave up on it creates nothing", async () => {
+    let forwarded!: () => void;
+    const late = new Promise<void>((resolve) => (forwarded = resolve));
+    const proxy = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      idleTimeout: 0,
+      async fetch(req) {
+        const u = new URL(req.url);
+        const body = req.method === "POST" ? await req.text() : undefined;
+        if (u.pathname === "/api/seki/acquire") {
+          await Bun.sleep(1500);
+          const res = await fetch(s.url + u.pathname, { method: "POST", headers: req.headers, body });
+          forwarded();
+          return res;
+        }
+        return fetch(s.url + u.pathname + u.search, { method: req.method, headers: req.headers, body });
+      },
+    });
+    try {
+      const marker = join(tempDir("seki-run-"), "ran");
+      const r = await seki(["run", "x23", "--exclusive", "--", "touch", marker], { SEKI_URL: `http://127.0.0.1:${proxy.port}`, SEKI_TIMEOUT_MS: "1000" });
+      expect(r.code).toBe(125);
+      expect(existsSync(marker)).toBe(false);
+      await late;
+      expect((await ls()).some((x) => x.resource === "x23")).toBe(false);
+    } finally {
+      proxy.stop(true);
+    }
+  });
+
+  test("a lost lease still gives the rest of the group the grace period to clean up", async () => {
+    const dir = tempDir("seki-run-");
+    const cleaned = join(dir, "cleaned");
+    const proxy = failingRenews();
+    try {
+      const r = await seki(["run", "x24", "--exclusive", "--ttl", "3s", "--", "sh", "-c", `(trap 'sleep 0.3; touch ${cleaned}; exit 0' TERM; sleep 61.71 & wait) & exec sleep 61.72`], { SEKI_URL: proxy.url, SEKI_KILL_AFTER_MS: "3000" });
+      expect(r.code).toBe(123);
+      expect(existsSync(cleaned)).toBe(true);
+      expect((await Bun.$`pgrep -f "sleep 61[.]7[12]"`.nothrow().quiet()).exitCode).toBe(1);
+    } finally {
+      proxy.stop();
+    }
+  });
+
+  test("a usable SEKI_TIMEOUT_MS is not needed for --version", async () => {
+    const r = await seki(["--version"], { SEKI_TIMEOUT_MS: "0" });
+    expect(r.code).toBe(0);
+  });
+
   test("SIGQUIT sent to seki reaches the command too", async () => {
     const marker = join(tempDir("seki-run-"), "started");
     const p = sekiProc(["run", "x21", "--exclusive", "--", "sh", "-c", `touch ${marker}; exec sleep 20`]);
@@ -474,7 +524,7 @@ describe("run", () => {
     expect((await ls()).some((x) => x.resource === "x21")).toBe(false);
   });
 
-  test.each([["SEKI_KILL_AFTER_MS", "-1"], ["SEKI_KILL_AFTER_MS", "soon"], ["SEKI_TIMEOUT_MS", "0"], ["SEKI_TIMEOUT_MS", "-5"]])(
+  test.each([["SEKI_KILL_AFTER_MS", "-1"], ["SEKI_KILL_AFTER_MS", "soon"], ["SEKI_KILL_AFTER_MS", "1e3"], ["SEKI_TIMEOUT_MS", "0"], ["SEKI_TIMEOUT_MS", "-5"], ["SEKI_TIMEOUT_MS", "0x10"]])(
     "%s=%s is refused before the command starts",
     async (k, v) => {
       const marker = join(tempDir("seki-run-"), "ran");

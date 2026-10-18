@@ -31,6 +31,7 @@ function validAcquire(b) {
   return text(b.resource, true) && text(b.holder, true) && text(b.host, false) && text(b.why, false) &&
     (b.mode === "shared" || b.mode === "exclusive") &&
     (b.renew === undefined || typeof b.renew === "boolean") &&
+    (b.not_after === undefined || Number.isInteger(b.not_after)) &&
     Number.isInteger(b.ttl_sec) && b.ttl_sec >= 1 && b.ttl_sec <= MAX_TTL_SEC
 }
 

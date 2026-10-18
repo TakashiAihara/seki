@@ -77,6 +77,14 @@ describe("modes", () => {
     expect((await leases()).some((l) => l.resource === "m3d")).toBe(false);
   });
 
+  test("a request that reaches the server after its not_after is refused with 408 and creates nothing", async () => {
+    const late = await post("acquire", { resource: "m6", holder: "a", mode: "exclusive", ttl_sec: 60, not_after: Date.now() - 1 });
+    expect(late.status).toBe(408);
+    expect((await leases()).some((l) => l.resource === "m6")).toBe(false);
+    const inTime = await post("acquire", { resource: "m6", holder: "a", mode: "exclusive", ttl_sec: 60, not_after: Date.now() + 5000 });
+    expect(inTime.status).toBe(200);
+  });
+
   test("a renew of a live lease extends it", async () => {
     await acquire("m3e", "a", "exclusive", 10);
     const r = await post("acquire", { resource: "m3e", holder: "a", mode: "exclusive", ttl_sec: 3600, renew: true });
@@ -133,6 +141,7 @@ describe("input", () => {
     [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, host: "h".repeat(501) }],
     [{ resource: "r".repeat(501), holder: "a", mode: "shared", ttl_sec: 60 }],
     [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, renew: "yes" }],
+    [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, not_after: "soon" }],
   ])("acquire rejects %j with 400", async (body) => {
     expect((await post("acquire", body)).status).toBe(400);
   });

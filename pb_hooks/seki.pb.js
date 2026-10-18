@@ -1,6 +1,9 @@
 /// <reference path="../pb_data/types.d.ts" />
 
 // Acquire and renew are the same call: the same holder asking again moves its expiry.
+// not_after (Unix ms) is when the client stops waiting for the answer: a request that
+// is processed later than that is refused with 408 and creates nothing, so a client
+// that gave up never leaves a lease behind it does not know about.
 // With renew: true the caller only wants to extend a live lease: if it is gone the
 // answer is 410 and nothing is created, so a renew delayed past the lease's expiry
 // cannot bring the lease back.
@@ -16,9 +19,14 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     return e.json(400, { ok: false, error: "resource and holder (strings up to 500 chars), mode (shared|exclusive) and ttl_sec (integer, 1 to 604800) are required; host and why are optional strings up to 500 chars" })
   }
 
-  const now = Date.now()
   let res
   $app.runInTransaction((tx) => {
+    // Taken inside the transaction: waiting for another one must not make an expired lease look live.
+    const now = Date.now()
+    if (b.not_after !== undefined && now > b.not_after) {
+      res = { status: 408, body: { ok: false, error: "the request arrived after its not_after" } }
+      return
+    }
     tx.db().newQuery("DELETE FROM leases WHERE expires_at < {:now}").bind({ now }).execute()
 
     const others = tx.findRecordsByFilter("leases", "resource = {:r} && holder != {:h}", "", 0, 0, { r: b.resource, h: b.holder })
