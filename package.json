@@ -1,0 +1,22 @@
+{
+  "name": "seki",
+  "private": true,
+  "description": "Shared / exclusive leases with TTL for resources that several agents or hosts contend for",
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "pretest": "sh scripts/fetch-pocketbase.sh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TakashiAihara/seki.git"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "commander": "15.0.0"
+  }
+}

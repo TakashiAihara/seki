@@ -1,0 +1,16 @@
+# systemd unit for the seki server. Expects the repository at /opt/seki
+# (scripts/fetch-pocketbase.sh already run) and SEKI_TOKEN in /etc/seki/env.
+[Unit]
+Description=seki lease server (PocketBase)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/seki/env
+WorkingDirectory=/opt/seki
+ExecStart=/opt/seki/bin/pocketbase serve --dir /var/lib/seki --hooksDir /opt/seki/pb_hooks --hooksWatch=false --migrationsDir /opt/seki/pb_migrations --http 0.0.0.0:8090
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
