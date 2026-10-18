@@ -405,6 +405,86 @@ describe("run", () => {
     }
   });
 
+  test("a process in the command's group that ignores SIGTERM does not outlive a lost lease", async () => {
+    const proxy = failingRenews();
+    try {
+      const r = await seki(["run", "x18", "--exclusive", "--ttl", "3s", "--", "sh", "-c", "(trap '' TERM; exec sleep 51.11) & sleep 51.12"], { SEKI_URL: proxy.url, SEKI_KILL_AFTER_MS: "1000" });
+      expect(r.code).toBe(123);
+      await Bun.sleep(300);
+      expect((await Bun.$`pgrep -f "sleep 51[.]1[12]"`.nothrow().quiet()).exitCode).toBe(1);
+    } finally {
+      proxy.stop();
+    }
+  });
+
+  test("a background process that ignores SIGTERM after a normal exit gets SIGKILL after the grace period", async () => {
+    const started = Date.now();
+    const r = await seki(["run", "x19b", "--exclusive", "--", "sh", "-c", "(trap '' TERM; exec sleep 51.14) & exit 0"], { SEKI_KILL_AFTER_MS: "1000" });
+    expect(r.code).toBe(0);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1000);
+    expect((await Bun.$`pgrep -f "sleep 51[.]14"`.nothrow().quiet()).exitCode).toBe(1);
+  });
+
+  test("background processes of a command that exits normally are stopped before the release", async () => {
+    const r = await seki(["run", "x19", "--exclusive", "--", "sh", "-c", "sleep 51.13 & exit 0"], { SEKI_KILL_AFTER_MS: "1000" });
+    expect(r.code).toBe(0);
+    expect((await Bun.$`pgrep -f "sleep 51[.]13"`.nothrow().quiet()).exitCode).toBe(1);
+  });
+
+  test("a renew cut off by the deadline but processed by the server later does not bring the lease back", async () => {
+    let acquires = 0;
+    let forwarded!: () => void;
+    const lateRenewDone = new Promise<void>((resolve) => (forwarded = resolve));
+    const proxy = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      idleTimeout: 0,
+      async fetch(req) {
+        const u = new URL(req.url);
+        const body = req.method === "POST" ? await req.text() : undefined;
+        if (u.pathname !== "/api/seki/acquire" || ++acquires === 1) {
+          return fetch(s.url + u.pathname + u.search, { method: req.method, headers: req.headers, body });
+        }
+        // The first renew still reaches the server, 3.5 s late, after run has given up on it.
+        if (acquires === 2) {
+          await Bun.sleep(3500);
+          const res = await fetch(s.url + u.pathname, { method: "POST", headers: req.headers, body });
+          forwarded();
+          return res;
+        }
+        return new Response("down", { status: 502 });
+      },
+    });
+    try {
+      const r = await seki(["run", "x20", "--exclusive", "--ttl", "3s", "--", "sleep", "20"], { SEKI_URL: `http://127.0.0.1:${proxy.port}` });
+      expect(r.code).toBe(123);
+      await lateRenewDone;
+      expect((await ls()).some((x) => x.resource === "x20")).toBe(false);
+    } finally {
+      proxy.stop(true);
+    }
+  });
+
+  test("SIGQUIT sent to seki reaches the command too", async () => {
+    const marker = join(tempDir("seki-run-"), "started");
+    const p = sekiProc(["run", "x21", "--exclusive", "--", "sh", "-c", `touch ${marker}; exec sleep 20`]);
+    for (let i = 0; i < 100 && !existsSync(marker); i++) await Bun.sleep(50);
+    p.kill("SIGQUIT");
+    expect(await p.exited).toBe(131);
+    expect((await ls()).some((x) => x.resource === "x21")).toBe(false);
+  });
+
+  test.each([["SEKI_KILL_AFTER_MS", "-1"], ["SEKI_KILL_AFTER_MS", "soon"], ["SEKI_TIMEOUT_MS", "0"], ["SEKI_TIMEOUT_MS", "-5"]])(
+    "%s=%s is refused before the command starts",
+    async (k, v) => {
+      const marker = join(tempDir("seki-run-"), "ran");
+      const r = await seki(["run", "x22", "--shared", "--", "touch", marker], { [k]: v });
+      expect(r.code).toBe(125);
+      expect(r.err).toContain(k);
+      expect(existsSync(marker)).toBe(false);
+    },
+  );
+
   test("when renews keep failing until the lease has lapsed, the command is stopped and run exits 123", async () => {
     const proxy = failingRenews();
     try {

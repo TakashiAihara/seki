@@ -23,10 +23,12 @@ seki run <resource> (--shared | --exclusive) [--ttl <duration>] [--why <text>] [
 - To renew, `acquire` again with the same holder. It replaces the caller's own lease (mode, ttl and reason), so it can also move a shared lease to exclusive when nobody else holds the resource.
 - `release` drops only the caller's own lease. Releasing something you do not hold prints `not held <resource>` and exits 0.
 - `run` takes the lease, runs the command, renews the lease in the background every third of the TTL, and releases it when the command ends, however it ends. If the lease cannot be taken the command is not started.
-- `run` stops the command when it loses the lease while the command runs: the lease lapsed before a renew got through (each renew is cut off at the lease's expiry, so a hung server cannot stretch it), the server answered a renew by creating a new lease (ours had run out in between), or another holder holds it now. Whoever holds the lease now was told the resource is theirs. The command gets SIGTERM, and SIGKILL `SEKI_KILL_AFTER_MS` later (default 10000) if it is still running.
-- The command runs in its own session and process group, so stopping it reaches its background children too. SIGINT, SIGTERM and SIGHUP sent to `run` (Ctrl-C included) are passed to that group, and `run` releases the lease after the command exits.
-- Because of that, the command has no controlling terminal: `run` is for batch commands, not for programs that read the terminal interactively.
+- `run` stops the command when it loses the lease while the command runs: the lease lapsed before a renew got through (each renew is cut off at the lease's expiry, so a hung server cannot stretch it), the server no longer had the lease when a renew arrived, or another holder holds it now. Whoever holds the lease now was told the resource is theirs. The command's whole process group gets SIGTERM, and SIGKILL `SEKI_KILL_AFTER_MS` later (default 10000) if any of it is still running. Until then the command can overlap the next holder by up to that long.
+- Renews are sent with `renew: true`, so a renew the server receives after the lease ran out is refused (410) instead of creating a new lease.
+- The command runs in its own session and process group. When the command exits, whatever is left of its group (background processes) gets SIGTERM, then SIGKILL after `SEKI_KILL_AFTER_MS`, and only then is the lease released. SIGINT, SIGTERM, SIGHUP and SIGQUIT sent to `run` (Ctrl-C and Ctrl-\ included) are passed to that group.
+- Because of that, the command has no controlling terminal. Piped stdin and stdout work as usual; what does not work is opening `/dev/tty` (password prompts of sudo, ssh or gpg) and job control (Ctrl-Z suspends neither the command nor its lease renewals). `run` is for batch commands.
 - `run` cannot stop the command if `run` itself is killed with SIGKILL: the lease then expires on its own while the command keeps running.
+- If the first answer from the server arrives after the lease would already have run out, `run` releases it and does not start the command (125).
 - The holder is `--holder <id>`, else `$SEKI_HOLDER`. `acquire` and `release` refuse to run without one (exit 2): there is no safe default, because every session of the same user on one host would get the same name, and a second exclusive acquire under the same name renews the first one's lease instead of being refused. Give each session its own holder (for an AI agent, its session id).
 - `run` always adds a random suffix to the holder (`<--holder, $SEKI_HOLDER or $USER@<hostname>>#<random>`), since it takes and releases its own lease: two runs of one session must not share a lease.
 - The host is always recorded as the machine's hostname.
@@ -58,8 +60,8 @@ A server that cannot be reached is exit 2, never 0: when seki cannot tell whethe
 | server URL | `SEKI_URL` | `url` |
 | bearer token | `SEKI_TOKEN` | `token`, then `token_command` (run with `sh -c`, stdout trimmed) |
 | holder | `SEKI_HOLDER` | (not read from the file: one file is shared by every session on the host) |
-| request timeout | `SEKI_TIMEOUT_MS` (default 10000) | |
-| `run`: SIGKILL after SIGTERM | `SEKI_KILL_AFTER_MS` (default 10000) | |
+| request timeout | `SEKI_TIMEOUT_MS` (default 10000, at least 1) | |
+| `run`: SIGKILL after SIGTERM | `SEKI_KILL_AFTER_MS` (default 10000, 0 = SIGKILL at once) | |
 
 The environment wins over the file. `$XDG_CONFIG_HOME` replaces `~/.config` when set.
 
@@ -85,7 +87,7 @@ All routes need `Authorization: Bearer <SEKI_TOKEN>`.
 
 | route | body | answer |
 | --- | --- | --- |
-| `POST /api/seki/acquire` | `{resource, holder, mode, ttl_sec (integer, 1 to 604800), host?, why?}`; strings up to 500 characters | 200 `{ok, renewed, lease}` (`renewed` is true when the holder's live lease was extended, false when a new one was created) / 409 `{ok: false, held_by: [lease...]}` / 400 |
+| `POST /api/seki/acquire` | `{resource, holder, mode, ttl_sec (integer, 1 to 604800), host?, why?, renew?}`; strings up to 500 characters | 200 `{ok, renewed, lease}` (`renewed` is true when the holder's live lease was extended, false when a new one was created) / 409 `{ok: false, held_by: [lease...]}` / 410 when `renew: true` and the holder has no live lease (nothing is created) / 400 |
 | `POST /api/seki/release` | `{resource, holder}` | 200 `{ok, released: <rows>}` |
 | `GET /api/seki/leases` | | 200 `{ok, leases: [lease...]}` (expired leases are left out) |
 

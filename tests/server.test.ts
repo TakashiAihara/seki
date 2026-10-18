@@ -66,6 +66,24 @@ describe("modes", () => {
     expect(again.renewed).toBe(true);
   });
 
+  test("a renew for a lease that is gone is refused with 410 and creates nothing", async () => {
+    const r = await post("acquire", { resource: "m3c", holder: "a", mode: "exclusive", ttl_sec: 60, renew: true });
+    expect(r.status).toBe(410);
+    expect((await leases()).some((l) => l.resource === "m3c")).toBe(false);
+
+    await acquire("m3d", "a", "exclusive", 1);
+    await Bun.sleep(1500);
+    expect((await post("acquire", { resource: "m3d", holder: "a", mode: "exclusive", ttl_sec: 60, renew: true })).status).toBe(410);
+    expect((await leases()).some((l) => l.resource === "m3d")).toBe(false);
+  });
+
+  test("a renew of a live lease extends it", async () => {
+    await acquire("m3e", "a", "exclusive", 10);
+    const r = await post("acquire", { resource: "m3e", holder: "a", mode: "exclusive", ttl_sec: 3600, renew: true });
+    expect(r.status).toBe(200);
+    expect(((await r.json()) as { renewed: boolean }).renewed).toBe(true);
+  });
+
   test("asking again after the lease lapsed creates a new one and says so", async () => {
     await acquire("m3b", "a", "exclusive", 1);
     await Bun.sleep(1500);
@@ -114,6 +132,7 @@ describe("input", () => {
     [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, why: 3 }],
     [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, host: "h".repeat(501) }],
     [{ resource: "r".repeat(501), holder: "a", mode: "shared", ttl_sec: 60 }],
+    [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, renew: "yes" }],
   ])("acquire rejects %j with 400", async (body) => {
     expect((await post("acquire", body)).status).toBe(400);
   });

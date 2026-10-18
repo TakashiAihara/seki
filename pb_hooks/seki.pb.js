@@ -1,6 +1,9 @@
 /// <reference path="../pb_data/types.d.ts" />
 
 // Acquire and renew are the same call: the same holder asking again moves its expiry.
+// With renew: true the caller only wants to extend a live lease: if it is gone the
+// answer is 410 and nothing is created, so a renew delayed past the lease's expiry
+// cannot bring the lease back.
 // The check and the write share one transaction. PocketBase runs transactions on
 // a single connection, so two acquires for the same resource cannot interleave.
 routerAdd("POST", "/api/seki/acquire", (e) => {
@@ -28,6 +31,10 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     // Expired rows were deleted above, so a row found here is a live lease being renewed.
     const mine = tx.findRecordsByFilter("leases", "resource = {:r} && holder = {:h}", "", 1, 0, { r: b.resource, h: b.holder })
     const renewed = mine.length > 0
+    if (b.renew === true && !renewed) {
+      res = { status: 410, body: { ok: false, error: "no live lease to renew" } }
+      return
+    }
     const rec = renewed ? mine[0] : new Record(tx.findCollectionByNameOrId("leases"))
     rec.set("resource", b.resource)
     rec.set("holder", b.holder)

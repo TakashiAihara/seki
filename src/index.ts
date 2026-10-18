@@ -109,7 +109,17 @@ function parseTtl(value: string): number {
   return sec;
 }
 
-const timeoutMs = Number(process.env.SEKI_TIMEOUT_MS) || 10_000;
+// An unusable value is refused, not replaced by the default: SEKI_TIMEOUT_MS=0 or
+// SEKI_KILL_AFTER_MS=-1 is a mistake the caller should hear about.
+function envMs(name: string, fallback: number, min: number): number {
+  const v = process.env[name];
+  if (v === undefined || v === "") return fallback;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < min) throw new Failure(2, `${name} must be an integer >= ${min} (milliseconds), got "${v}"`);
+  return n;
+}
+
+let timeoutMs = 10_000;
 
 async function call(cfg: Config, method: "GET" | "POST", path: string, body?: unknown, limitMs = timeoutMs): Promise<Reply> {
   try {
@@ -138,9 +148,9 @@ function expectStatus<T>(r: Reply, status: number): T {
   return parseReply<T>(r);
 }
 
-type AcquireBody = { resource: string; holder: string; mode: Mode; ttl_sec: number; host: string; why?: string };
+type AcquireBody = { resource: string; holder: string; mode: Mode; ttl_sec: number; host: string; why?: string; renew?: boolean };
 
-type AcquireResult = { lease: Lease; renewed: boolean } | { heldBy: Lease[] };
+type AcquireResult = { lease: Lease; renewed: boolean } | { heldBy: Lease[] } | { gone: true };
 
 async function acquire(cfg: Config, body: AcquireBody, limitMs?: number): Promise<AcquireResult> {
   const r = await call(cfg, "POST", "/api/seki/acquire", body, limitMs);
@@ -151,6 +161,7 @@ async function acquire(cfg: Config, body: AcquireBody, limitMs?: number): Promis
   }
   if (r.status === 200 && data.lease) return { lease: data.lease, renewed: data.renewed === true };
   if (r.status === 409 && data.held_by) return { heldBy: data.held_by };
+  if (r.status === 410 && body.renew) return { gone: true };
   throw new Failure(2, `server returned ${r.status}: ${r.text}`);
 }
 
@@ -205,6 +216,7 @@ async function acquireCmd(resource: string, o: LeaseOpts): Promise<number> {
   const cfg = await connect(await loadFileConfig());
   const r = await acquire(cfg, { resource, holder, mode, ttl_sec: o.ttl, host: hostname(), why: o.why });
   if ("heldBy" in r) throw new Failure(1, heldMessage(resource, r.heldBy));
+  if (!("lease" in r)) throw new Failure(2, "unexpected answer from the server");
   console.log(`acquired ${resource} ${mode} until ${new Date(r.lease.expires_at).toISOString()}`);
   return 0;
 }
@@ -232,10 +244,10 @@ const RUN_FAILED = 125;
 const RUN_NOT_EXECUTABLE = 126;
 const RUN_NOT_FOUND = 127;
 
-const killAfterMs = Number(process.env.SEKI_KILL_AFTER_MS) || 10_000;
 
 async function runCmd(resource: string, command: string[], o: LeaseOpts): Promise<number> {
   const mode = modeOf(o);
+  const killAfterMs = envMs("SEKI_KILL_AFTER_MS", 10_000, 0);
   const holder = runHolder(o.holder);
   const cfg = await connect(await loadFileConfig());
   const body: AcquireBody = { resource, holder, mode, ttl_sec: o.ttl, host: hostname(), why: o.why };
@@ -253,9 +265,14 @@ async function runCmd(resource: string, command: string[], o: LeaseOpts): Promis
   if ("heldBy" in first) throw new Failure(RUN_HELD, heldMessage(resource, first.heldBy));
   // Counted from when the request left, so a slow answer cannot make the lease look longer than it is.
   let validUntil = sentAt + o.ttl * 1000;
+  if (performance.now() >= validUntil) {
+    await dropLease(cfg, resource, holder);
+    throw new Failure(RUN_FAILED, `the server answered after the ${o.ttl}s lease had already run out; not starting the command`);
+  }
 
-  // Its own session and process group: the whole command (background children
-  // included) can be signalled at once, and seki alone decides what reaches it.
+  // Its own session and process group, so the whole command (background children
+  // included) can be signalled at once, and the terminal's signals reach seki, which
+  // passes them on.
   let child: Subprocess;
   try {
     child = Bun.spawn(command, { stdin: "inherit", stdout: "inherit", stderr: "inherit", detached: true });
@@ -273,7 +290,7 @@ async function runCmd(resource: string, command: string[], o: LeaseOpts): Promis
   };
 
   // Losing the lease stops the command: whoever holds it now was told the resource is theirs.
-  // A command that ignores SIGTERM is killed after killAfterMs.
+  // A group that is still there killAfterMs after SIGTERM gets SIGKILL.
   let lost: string | undefined;
   let killer: Timer | undefined;
   const loseLease = (why: string) => {
@@ -298,9 +315,9 @@ async function runCmd(resource: string, command: string[], o: LeaseOpts): Promis
     renewing = (async () => {
       const sent = performance.now();
       try {
-        const r = await acquire(cfg, body, Math.min(timeoutMs, Math.max(1, validUntil - sent)));
-        if (lost) return;
+        const r = await acquire(cfg, { ...body, renew: true }, Math.min(timeoutMs, Math.max(1, validUntil - sent)));
         if ("heldBy" in r) return loseLease(heldMessage(resource, r.heldBy));
+        if ("gone" in r) return loseLease("the server no longer had the lease when the renew arrived");
         // A new lease instead of a renewed one means ours ran out on the server in between,
         // and someone else may have held the resource meanwhile.
         if (!r.renewed) return loseLease("the server no longer had the lease when the renew arrived");
@@ -319,10 +336,13 @@ async function runCmd(resource: string, command: string[], o: LeaseOpts): Promis
   // reaches seki only; all three are passed on to the command's group. The handlers stay
   // until the lease is released, so a second signal cannot cut the release short.
   const forward = (sig: NodeJS.Signals) => signalGroup(sig);
-  const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"] as const;
   for (const s of signals) process.on(s, forward);
   try {
     await child.exited;
+    // The leader is gone, but other processes of the group may not be; none may keep
+    // the resource past the release.
+    await drainGroup(child.pid, lost ? 0 : killAfterMs);
   } finally {
     clearInterval(renew);
     clearTimeout(deadline);
@@ -340,6 +360,31 @@ async function runCmd(resource: string, command: string[], o: LeaseOpts): Promis
   const sig = child.signalCode;
   if (typeof sig !== "string") throw new Failure(RUN_FAILED, "child exited without a code or a signal");
   return 128 + constants.signals[sig];
+}
+
+function groupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// SIGTERM to what is left of the group, SIGKILL after graceMs, and wait until it is empty.
+async function drainGroup(pgid: number, graceMs: number): Promise<void> {
+  if (!groupAlive(pgid)) return;
+  const signal = (sig: NodeJS.Signals) => {
+    try {
+      process.kill(-pgid, sig);
+    } catch {}
+  };
+  signal(graceMs > 0 ? "SIGTERM" : "SIGKILL");
+  const until = performance.now() + graceMs;
+  while (groupAlive(pgid) && performance.now() < until) await Bun.sleep(50);
+  if (!groupAlive(pgid)) return;
+  signal("SIGKILL");
+  for (let i = 0; i < 40 && groupAlive(pgid); i++) await Bun.sleep(50);
 }
 
 const valueOptions = new Set(["--holder", "--ttl", "--why"]);
@@ -370,6 +415,12 @@ function addLeaseOptions(c: Command): Command {
 
 async function main(argv: string[]): Promise<number> {
   let code = 0;
+  try {
+    timeoutMs = envMs("SEKI_TIMEOUT_MS", 10_000, 1);
+  } catch (e) {
+    console.error(errText(e));
+    return argv[0] === "run" ? RUN_FAILED : 2;
+  }
   // Set by the run action, so a usage error inside run is reported with run's codes.
   let inRun = false;
 
