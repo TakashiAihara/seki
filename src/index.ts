@@ -145,6 +145,10 @@ type AcquireResult = { lease: Lease; renewed: boolean } | { heldBy: Lease[] };
 async function acquire(cfg: Config, body: AcquireBody, limitMs?: number): Promise<AcquireResult> {
   const r = await call(cfg, "POST", "/api/seki/acquire", body, limitMs);
   const data = parseReply<{ lease?: Lease; renewed?: boolean; held_by?: Lease[] }>(r);
+  // run needs to know a renew from a fresh lease; a server that does not say is too old to trust with it.
+  if (r.status === 200 && data.lease && typeof data.renewed !== "boolean") {
+    throw new Failure(2, "the server's acquire answer has no `renewed`; update the seki server");
+  }
   if (r.status === 200 && data.lease) return { lease: data.lease, renewed: data.renewed === true };
   if (r.status === 409 && data.held_by) return { heldBy: data.held_by };
   throw new Failure(2, `server returned ${r.status}: ${r.text}`);
@@ -238,7 +242,14 @@ async function runCmd(resource: string, command: string[], o: LeaseOpts): Promis
 
   // performance.now() is monotonic: a wall-clock step cannot stretch the lease.
   const sentAt = performance.now();
-  const first = await acquire(cfg, body);
+  let first: AcquireResult;
+  try {
+    first = await acquire(cfg, body);
+  } catch (e) {
+    // The server may have created the lease before the answer turned out unusable.
+    await dropLease(cfg, resource, holder);
+    throw e;
+  }
   if ("heldBy" in first) throw new Failure(RUN_HELD, heldMessage(resource, first.heldBy));
   // Counted from when the request left, so a slow answer cannot make the lease look longer than it is.
   let validUntil = sentAt + o.ttl * 1000;

@@ -314,9 +314,12 @@ describe("run", () => {
   });
 
   test.each([
-    ["missing", "/nonexistent/seki-test-cmd", 127],
-    ["not executable", "/etc/hostname", 126],
-  ])("a command that is %s (%s) exits %i and releases the lease", async (_, cmd, code) => {
+    ["missing", 127],
+    ["not executable", 126],
+  ])("a command that is %s exits %i and releases the lease", async (kind, code) => {
+    const dir = tempDir("seki-run-");
+    const cmd = join(dir, "cmd");
+    if (kind === "not executable") writeFileSync(cmd, "#!/bin/sh\n", { mode: 0o644 });
     const r = await seki(["run", `x14-${code}`, "--exclusive", "--", cmd]);
     expect(r.code).toBe(code);
     expect((await ls()).some((x) => x.resource === `x14-${code}`)).toBe(false);
@@ -334,6 +337,32 @@ describe("run", () => {
     expect(r.code).toBe(123);
     expect(r.err).toContain("thief");
     expect(Date.now() - started).toBeLessThan(4000);
+  });
+
+  test("a server that does not say whether it renewed is refused before the command starts", async () => {
+    const proxy = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(req) {
+        const u = new URL(req.url);
+        const body = req.method === "POST" ? await req.text() : undefined;
+        const res = await fetch(s.url + u.pathname + u.search, { method: req.method, headers: req.headers, body });
+        if (u.pathname !== "/api/seki/acquire" || res.status !== 200) return res;
+        const data = (await res.json()) as Record<string, unknown>;
+        delete data.renewed;
+        return Response.json(data);
+      },
+    });
+    try {
+      const marker = join(tempDir("seki-run-"), "ran");
+      const r = await seki(["run", "x17", "--exclusive", "--", "touch", marker], { SEKI_URL: `http://127.0.0.1:${proxy.port}` });
+      expect(r.code).toBe(125);
+      expect(r.err).toContain("renewed");
+      expect(existsSync(marker)).toBe(false);
+      expect((await ls()).some((x) => x.resource === "x17")).toBe(false);
+    } finally {
+      proxy.stop(true);
+    }
   });
 
   test("a renew that the server answers by creating a new lease counts as lost", async () => {
