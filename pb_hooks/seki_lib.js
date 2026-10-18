@@ -20,12 +20,17 @@ function lease(o) {
 }
 
 const MAX_TTL_SEC = 7 * 24 * 3600
+const MAX_TEXT = 500
+
+function text(v, required) {
+  if (v === undefined || v === null) return !required
+  return typeof v === "string" && v.length <= MAX_TEXT && (!required || v !== "")
+}
 
 function validAcquire(b) {
-  return typeof b.resource === "string" && b.resource !== "" &&
-    typeof b.holder === "string" && b.holder !== "" &&
+  return text(b.resource, true) && text(b.holder, true) && text(b.host, false) && text(b.why, false) &&
     (b.mode === "shared" || b.mode === "exclusive") &&
-    typeof b.ttl_sec === "number" && Number.isFinite(b.ttl_sec) && b.ttl_sec > 0 && b.ttl_sec <= MAX_TTL_SEC
+    Number.isInteger(b.ttl_sec) && b.ttl_sec >= 1 && b.ttl_sec <= MAX_TTL_SEC
 }
 
 module.exports = { authorize, lease, validAcquire }

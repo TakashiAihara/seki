@@ -73,7 +73,7 @@ async function connect(file: FileConfig): Promise<Config> {
   return { url, token: await resolveToken(file) };
 }
 
-// There is no default holder for acquire / renew / release: every session of the
+// There is no default holder for acquire / release: every session of the
 // same user on one host would share it, and the second exclusive acquire would
 // renew the first one's lease instead of being refused.
 function resolveHolder(flag: string | undefined): string {
@@ -82,9 +82,11 @@ function resolveHolder(flag: string | undefined): string {
   throw new Failure(2, "set --holder or SEKI_HOLDER: two callers with the same holder share one lease");
 }
 
-// run owns its lease from start to end, so a name unique to this invocation is safe.
+// run takes and releases its own lease, so its holder is always made unique to the
+// invocation: two runs of one session (same SEKI_HOLDER) must not share a lease.
 function runHolder(flag: string | undefined): string {
-  return flag || process.env.SEKI_HOLDER || `${process.env.USER || "unknown"}@${hostname()}#${crypto.randomUUID().slice(0, 8)}`;
+  const base = flag || process.env.SEKI_HOLDER || `${process.env.USER || "unknown"}@${hostname()}`;
+  return `${base}#${crypto.randomUUID().slice(0, 8)}`;
 }
 
 const MAX_TTL_SEC = 7 * 24 * 3600;
@@ -109,13 +111,13 @@ function parseTtl(value: string): number {
 
 const timeoutMs = Number(process.env.SEKI_TIMEOUT_MS) || 10_000;
 
-async function call(cfg: Config, method: "GET" | "POST", path: string, body?: unknown): Promise<Reply> {
+async function call(cfg: Config, method: "GET" | "POST", path: string, body?: unknown, limitMs = timeoutMs): Promise<Reply> {
   try {
     const res = await fetch(cfg.url.replace(/\/+$/, "") + path, {
       method,
       headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.timeout(limitMs),
     });
     return { status: res.status, text: await res.text() };
   } catch (e) {
@@ -138,12 +140,12 @@ function expectStatus<T>(r: Reply, status: number): T {
 
 type AcquireBody = { resource: string; holder: string; mode: Mode; ttl_sec: number; host: string; why?: string };
 
-type AcquireResult = { lease: Lease } | { heldBy: Lease[] };
+type AcquireResult = { lease: Lease; renewed: boolean } | { heldBy: Lease[] };
 
-async function acquire(cfg: Config, body: AcquireBody): Promise<AcquireResult> {
-  const r = await call(cfg, "POST", "/api/seki/acquire", body);
-  const data = parseReply<{ lease?: Lease; held_by?: Lease[] }>(r);
-  if (r.status === 200 && data.lease) return { lease: data.lease };
+async function acquire(cfg: Config, body: AcquireBody, limitMs?: number): Promise<AcquireResult> {
+  const r = await call(cfg, "POST", "/api/seki/acquire", body, limitMs);
+  const data = parseReply<{ lease?: Lease; renewed?: boolean; held_by?: Lease[] }>(r);
+  if (r.status === 200 && data.lease) return { lease: data.lease, renewed: data.renewed === true };
   if (r.status === 409 && data.held_by) return { heldBy: data.held_by };
   throw new Failure(2, `server returned ${r.status}: ${r.text}`);
 }
@@ -218,82 +220,128 @@ async function lsCmd(o: { json?: boolean }): Promise<number> {
   return 0;
 }
 
+// run's own outcomes, kept out of the range a command normally uses for itself
+// (the command's own code is passed through; see the README's exit code table).
+const RUN_HELD = 124;
+const RUN_LOST = 123;
+const RUN_FAILED = 125;
+const RUN_NOT_EXECUTABLE = 126;
+const RUN_NOT_FOUND = 127;
+
+const killAfterMs = Number(process.env.SEKI_KILL_AFTER_MS) || 10_000;
+
 async function runCmd(resource: string, command: string[], o: LeaseOpts): Promise<number> {
   const mode = modeOf(o);
   const holder = runHolder(o.holder);
   const cfg = await connect(await loadFileConfig());
   const body: AcquireBody = { resource, holder, mode, ttl_sec: o.ttl, host: hostname(), why: o.why };
 
-  const sentAt = Date.now();
+  // performance.now() is monotonic: a wall-clock step cannot stretch the lease.
+  const sentAt = performance.now();
   const first = await acquire(cfg, body);
-  if ("heldBy" in first) throw new Failure(1, heldMessage(resource, first.heldBy));
+  if ("heldBy" in first) throw new Failure(RUN_HELD, heldMessage(resource, first.heldBy));
   // Counted from when the request left, so a slow answer cannot make the lease look longer than it is.
   let validUntil = sentAt + o.ttl * 1000;
 
+  // Its own session and process group: the whole command (background children
+  // included) can be signalled at once, and seki alone decides what reaches it.
   let child: Subprocess;
   try {
-    child = Bun.spawn(command, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+    child = Bun.spawn(command, { stdin: "inherit", stdout: "inherit", stderr: "inherit", detached: true });
   } catch (e) {
     await dropLease(cfg, resource, holder);
-    throw new Failure(2, `cannot start ${command[0]}: ${errText(e)}`);
+    const code = (e as { code?: string }).code;
+    if (code === "ENOENT") throw new Failure(RUN_NOT_FOUND, `${command[0]}: not found`);
+    if (code === "EACCES") throw new Failure(RUN_NOT_EXECUTABLE, `${command[0]}: not executable`);
+    throw new Failure(RUN_FAILED, `cannot start ${command[0]}: ${errText(e)}`);
   }
+  const signalGroup = (sig: NodeJS.Signals) => {
+    try {
+      process.kill(-child.pid, sig);
+    } catch {}
+  };
 
   // Losing the lease stops the command: whoever holds it now was told the resource is theirs.
+  // A command that ignores SIGTERM is killed after killAfterMs.
   let lost: string | undefined;
+  let killer: Timer | undefined;
   const loseLease = (why: string) => {
     if (lost) return;
     lost = why;
     console.error(`seki: lost the lease on ${resource}: ${why}; stopping the command`);
-    child.kill("SIGTERM");
+    signalGroup("SIGTERM");
+    killer = setTimeout(() => signalGroup("SIGKILL"), killAfterMs);
   };
 
+  // The deadline fires at the lease's own expiry, whatever the renews are doing; a renew
+  // that hangs cannot keep the command running past it.
+  const lapsed = () => loseLease("the lease lapsed before a renew got through");
+  let deadline = setTimeout(lapsed, validUntil - performance.now());
+
   // A third of the ttl: one renew can fail and the next still lands before expiry.
-  // Renews are chained so they never overlap, and the release waits for the last
-  // one: a renew still on the wire would otherwise recreate the lease after it.
-  let renewing: Promise<void> = Promise.resolve();
+  // One renew at a time, each cut off when the lease would lapse anyway, and the release
+  // waits for it: a renew still on the wire would otherwise recreate the lease after it.
+  let renewing: Promise<void> | undefined;
   const renew = setInterval(() => {
-    renewing = renewing.then(async () => {
-      if (lost) return;
-      const sent = Date.now();
+    if (lost || renewing) return;
+    renewing = (async () => {
+      const sent = performance.now();
       try {
-        const r = await acquire(cfg, body);
+        const r = await acquire(cfg, body, Math.min(timeoutMs, Math.max(1, validUntil - sent)));
+        if (lost) return;
         if ("heldBy" in r) return loseLease(heldMessage(resource, r.heldBy));
+        // A new lease instead of a renewed one means ours ran out on the server in between,
+        // and someone else may have held the resource meanwhile.
+        if (!r.renewed) return loseLease("the server no longer had the lease when the renew arrived");
         validUntil = sent + o.ttl * 1000;
+        clearTimeout(deadline);
+        deadline = setTimeout(lapsed, validUntil - performance.now());
       } catch (e) {
-        if (Date.now() >= validUntil) return loseLease(`renew failed until the lease lapsed (${errText(e)})`);
-        console.error(`warning: renew ${resource} failed: ${errText(e)}`);
+        if (!lost) console.error(`warning: renew ${resource} failed: ${errText(e)}`);
+      } finally {
+        renewing = undefined;
       }
-    });
+    })();
   }, (o.ttl * 1000) / 3);
 
-  // A Ctrl-C from the terminal already reaches the child (same process group), so SIGINT is
-  // not forwarded; seki only stays alive to release after the child exits. SIGTERM and SIGHUP
-  // are addressed to seki alone and are passed on.
-  const ignore = () => {};
-  const forward = (sig: NodeJS.Signals) => child.kill(sig);
-  process.on("SIGINT", ignore);
-  process.on("SIGTERM", forward);
-  process.on("SIGHUP", forward);
+  // The command is no longer in the terminal's process group, so a Ctrl-C or a hangup
+  // reaches seki only; all three are passed on to the command's group. The handlers stay
+  // until the lease is released, so a second signal cannot cut the release short.
+  const forward = (sig: NodeJS.Signals) => signalGroup(sig);
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  for (const s of signals) process.on(s, forward);
   try {
     await child.exited;
   } finally {
     clearInterval(renew);
-    process.off("SIGINT", ignore);
-    process.off("SIGTERM", forward);
-    process.off("SIGHUP", forward);
+    clearTimeout(deadline);
+    if (killer) clearTimeout(killer);
     await renewing;
+    // Always released, lost or not: the holder is unique to this run, so this can only
+    // drop a lease this run created (a renew may have created one after ours lapsed).
     await dropLease(cfg, resource, holder);
+    for (const s of signals) process.off(s, forward);
   }
 
-  if (lost) throw new Failure(1, "");
+  if (lost) throw new Failure(RUN_LOST, "");
   const code = child.exitCode;
   if (code !== null) return code;
   const sig = child.signalCode;
-  if (typeof sig !== "string") throw new Failure(2, "child exited without a code or a signal");
+  if (typeof sig !== "string") throw new Failure(RUN_FAILED, "child exited without a code or a signal");
   return 128 + constants.signals[sig];
 }
 
 const valueOptions = new Set(["--holder", "--ttl", "--why"]);
+
+// The index of the -- that ends seki's own arguments, skipping the values of options
+// that take one (in `--why -- -- cmd` the first -- is the reason).
+function separatorIndex(argv: string[]): number {
+  for (let i = 1; i < argv.length; i++) {
+    if (argv[i] === "--") return i;
+    if (valueOptions.has(argv[i]!)) i++;
+  }
+  return -1;
+}
 
 function addHolder(c: Command): Command {
   return c.option("--holder <name>", "holder name; default $SEKI_HOLDER");
@@ -311,6 +359,8 @@ function addLeaseOptions(c: Command): Command {
 
 async function main(argv: string[]): Promise<number> {
   let code = 0;
+  // Set by the run action, so a usage error inside run is reported with run's codes.
+  let inRun = false;
 
   const program = new Command()
     .name("seki")
@@ -318,10 +368,11 @@ async function main(argv: string[]): Promise<number> {
     .version(version)
     .exitOverride();
 
-  const lease = async (resource: string, o: LeaseOpts) => {
-    code = await acquireCmd(resource, o);
-  };
-  addLeaseOptions(program.command("acquire").description("take a lease, or extend your own").argument("<resource>")).action(lease);
+  addLeaseOptions(program.command("acquire").description("take a lease, or extend your own").argument("<resource>")).action(
+    async (resource: string, o: LeaseOpts) => {
+      code = await acquireCmd(resource, o);
+    },
+  );
 
   addHolder(program.command("release").description("drop a lease you hold").argument("<resource>")).action(
     async (resource: string, o: { holder?: string }) => {
@@ -329,37 +380,43 @@ async function main(argv: string[]): Promise<number> {
     },
   );
 
-  program.command("ls").description("list live leases")
+  program
+    .command("ls")
+    .description("list live leases")
     .option("--json", "print the leases as JSON")
     .action(async (o: { json?: boolean }) => {
       code = await lsCmd(o);
     });
 
-  addLeaseOptions(
+  const run = addLeaseOptions(
     program.command("run").description("hold a lease while a command runs").argument("<resource>").argument("<command...>"),
-  ).action(async (resource: string, command: string[], o: LeaseOpts) => {
-    // Commander drops the -- separator. The command must be exactly what follows the first
-    // bare -- that is not the value of an option taking one (--why -- reads "--" as the reason).
-    let sep = argv.indexOf("--");
-    while (sep > 0 && valueOptions.has(argv[sep - 1]!)) sep = argv.indexOf("--", sep + 1);
-    if (sep < 0 || argv.slice(sep + 1).join("\0") !== command.join("\0")) {
-      throw new Failure(2, "put -- before the command: seki run <resource> --shared -- <command>");
-    }
-    code = await runCmd(resource, command, o);
+  )
+    .action(async (resource: string, command: string[], o: LeaseOpts) => {
+      inRun = true;
+      const sep = separatorIndex(argv);
+      if (sep < 0 || argv.slice(sep + 1).join("\0") !== command.join("\0")) {
+        throw new Failure(2, "put -- before the command: seki run <resource> --shared -- <command>");
+      }
+      code = await runCmd(resource, command, o);
+    });
+  run.exitOverride((e) => {
+    inRun = true;
+    throw e;
   });
 
-  // run passes the command's exit code through, so its own outcomes move out of the way:
-  // 124 = held or lost (as timeout(1) uses 124), 125 = seki failed (as env(1) uses 125).
-  const own = (c: number) => (argv[0] !== "run" || c === 0 ? c : c === 1 ? 124 : 125);
+  // Failures that are not run's own codes (usage, config, server) become 125 under run.
+  const asRun = (c: number) => (c === 0 || c >= RUN_LOST ? c : RUN_FAILED);
+  const finish = (c: number) => (inRun ? asRun(c) : c);
   try {
     await program.parseAsync(argv, { from: "user" });
   } catch (e) {
-    if (e instanceof CommanderError) return own(e.exitCode === 0 ? 0 : 2);
+    if (e instanceof CommanderError) return finish(e.exitCode === 0 ? 0 : 2);
     if (e instanceof Failure) {
       if (e.message) console.error(e.message);
-      return own(e.code);
+      return finish(e.code);
     }
-    throw e;
+    console.error(`seki: unexpected error: ${errText(e)}`);
+    return finish(2);
   }
   return code;
 }

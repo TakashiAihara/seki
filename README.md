@@ -12,8 +12,8 @@ The server is [PocketBase](https://pocketbase.io) with the hooks and migration i
 ## CLI
 
 ```text
-seki acquire <resource> (--shared | --exclusive) [--ttl <duration>] [--why <text>] [--holder <id>]
-seki release <resource> [--holder <id>]
+seki acquire <resource> (--shared | --exclusive) [--ttl <duration>] [--why <text>] (--holder <id> | $SEKI_HOLDER)
+seki release <resource> (--holder <id> | $SEKI_HOLDER)
 seki ls [--json]
 seki run <resource> (--shared | --exclusive) [--ttl <duration>] [--why <text>] [--holder <id>] -- <command> [args...]
 ```
@@ -23,10 +23,12 @@ seki run <resource> (--shared | --exclusive) [--ttl <duration>] [--why <text>] [
 - To renew, `acquire` again with the same holder. It replaces the caller's own lease (mode, ttl and reason), so it can also move a shared lease to exclusive when nobody else holds the resource.
 - `release` drops only the caller's own lease. Releasing something you do not hold prints `not held <resource>` and exits 0.
 - `run` takes the lease, runs the command, renews the lease in the background every third of the TTL, and releases it when the command ends, however it ends. If the lease cannot be taken the command is not started.
-- If `run` loses the lease while the command runs — another holder took it after it lapsed, or renews kept failing until it lapsed — it stops the command with SIGTERM. Whoever holds the lease now was told the resource is theirs.
-- SIGTERM and SIGHUP sent to `run` are passed to the command. SIGINT is not: Ctrl-C in a terminal already reaches the command, and `run` waits for the command to exit before releasing.
-- The holder is `--holder <id>`, else `$SEKI_HOLDER`. `acquire`, `renew` and `release` refuse to run without one (exit 2): there is no safe default, because every session of the same user on one host would get the same name, and a second exclusive acquire under the same name renews the first one's lease instead of being refused. Give each session its own holder (for an AI agent, its session id).
-- `run` without a holder makes one for that invocation (`$USER@<hostname>#<random>`), since it takes and releases its own lease.
+- `run` stops the command when it loses the lease while the command runs: the lease lapsed before a renew got through (each renew is cut off at the lease's expiry, so a hung server cannot stretch it), the server answered a renew by creating a new lease (ours had run out in between), or another holder holds it now. Whoever holds the lease now was told the resource is theirs. The command gets SIGTERM, and SIGKILL `SEKI_KILL_AFTER_MS` later (default 10000) if it is still running.
+- The command runs in its own session and process group, so stopping it reaches its background children too. SIGINT, SIGTERM and SIGHUP sent to `run` (Ctrl-C included) are passed to that group, and `run` releases the lease after the command exits.
+- Because of that, the command has no controlling terminal: `run` is for batch commands, not for programs that read the terminal interactively.
+- `run` cannot stop the command if `run` itself is killed with SIGKILL: the lease then expires on its own while the command keeps running.
+- The holder is `--holder <id>`, else `$SEKI_HOLDER`. `acquire` and `release` refuse to run without one (exit 2): there is no safe default, because every session of the same user on one host would get the same name, and a second exclusive acquire under the same name renews the first one's lease instead of being refused. Give each session its own holder (for an AI agent, its session id).
+- `run` always adds a random suffix to the holder (`<--holder, $SEKI_HOLDER or $USER@<hostname>>#<random>`), since it takes and releases its own lease: two runs of one session must not share a lease.
 - The host is always recorded as the machine's hostname.
 
 ### Exit codes
@@ -41,8 +43,11 @@ seki run <resource> (--shared | --exclusive) [--ttl <duration>] [--why <text>] [
 
 | code | meaning for `run` |
 | --- | --- |
-| 124 | the lease could not be taken, or was lost while the command ran (as `timeout` uses 124) |
-| 125 | seki itself failed: usage, configuration, server (as `env` uses 125) |
+| 123 | the lease was lost while the command ran, and the command was stopped |
+| 124 | the lease could not be taken; the command did not start (as `timeout` uses 124) |
+| 125 | seki itself failed before the command started: usage, configuration, server (as `env` uses 125) |
+| 126 | the command is not executable (as `env`) |
+| 127 | the command was not found (as `env`) |
 
 A server that cannot be reached is exit 2, never 0: when seki cannot tell whether the resource is free, the caller should not touch it.
 
@@ -54,12 +59,13 @@ A server that cannot be reached is exit 2, never 0: when seki cannot tell whethe
 | bearer token | `SEKI_TOKEN` | `token`, then `token_command` (run with `sh -c`, stdout trimmed) |
 | holder | `SEKI_HOLDER` | (not read from the file: one file is shared by every session on the host) |
 | request timeout | `SEKI_TIMEOUT_MS` (default 10000) | |
+| `run`: SIGKILL after SIGTERM | `SEKI_KILL_AFTER_MS` (default 10000) | |
 
 The environment wins over the file. `$XDG_CONFIG_HOME` replaces `~/.config` when set.
 
 ## Server
 
-- Fetch PocketBase with `scripts/fetch-pocketbase.sh` (the version is pinned in `.pocketbase-version`), then run it with this repository's hooks and migrations:
+- Fetch PocketBase with `scripts/fetch-pocketbase.sh` (the version is pinned in `.pocketbase-version`, the archives' sha256 in `.pocketbase-sha256`), then run it with this repository's hooks and migrations:
 
 ```bash
 SEKI_TOKEN=<shared token> bin/pocketbase serve --dir /var/lib/seki --hooksDir pb_hooks --migrationsDir pb_migrations --http 0.0.0.0:8090
@@ -69,7 +75,8 @@ SEKI_TOKEN=<shared token> bin/pocketbase serve --dir /var/lib/seki --hooksDir pb
 - Trust model: anyone with the token can take, extend and release any lease. The holder is a name the client sends, not an identity the server checks; it keeps honest callers apart, not hostile ones.
 - The server speaks plain HTTP. Put it behind TLS if the token should not cross the network in the clear.
 - The server applies the migrations in `pb_migrations/` on start, so updating the checkout and restarting can change the schema.
-- The PocketBase admin UI (`/_/`) shows the `leases` collection and is the dashboard. Create the first superuser with `bin/pocketbase superuser upsert <email> <password> --dir /var/lib/seki`.
+- The PocketBase admin UI (`/_/`) shows the `leases` collection and is the dashboard. Create the first superuser as the service's user, so the data files stay owned by it: `runuser -u seki -- bin/pocketbase superuser upsert <email> <password> --dir /var/lib/seki`.
+- `deploy/seki.service` runs the server as the system user `seki` with the data in `/var/lib/seki`; `deploy/update.sh` brings `/opt/seki` to `origin/main` and restarts it.
 - The lease records are not readable through PocketBase's own record API; only the routes below serve them.
 
 ### HTTP API
@@ -78,7 +85,7 @@ All routes need `Authorization: Bearer <SEKI_TOKEN>`.
 
 | route | body | answer |
 | --- | --- | --- |
-| `POST /api/seki/acquire` | `{resource, holder, mode, ttl_sec (1 to 604800), host?, why?}` | 200 `{ok, lease}` / 409 `{ok: false, held_by: [lease...]}` / 400 |
+| `POST /api/seki/acquire` | `{resource, holder, mode, ttl_sec (integer, 1 to 604800), host?, why?}`; strings up to 500 characters | 200 `{ok, renewed, lease}` (`renewed` is true when the holder's live lease was extended, false when a new one was created) / 409 `{ok: false, held_by: [lease...]}` / 400 |
 | `POST /api/seki/release` | `{resource, holder}` | 200 `{ok, released: <rows>}` |
 | `GET /api/seki/leases` | | 200 `{ok, leases: [lease...]}` (expired leases are left out) |
 

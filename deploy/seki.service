@@ -1,5 +1,6 @@
 # systemd unit for the seki server. Expects the repository at /opt/seki
-# (scripts/fetch-pocketbase.sh already run) and SEKI_TOKEN in /etc/seki/env.
+# (scripts/fetch-pocketbase.sh already run), SEKI_TOKEN in /etc/seki/env, and a
+# system user `seki` (useradd --system --no-create-home seki).
 [Unit]
 Description=seki lease server (PocketBase)
 After=network-online.target
@@ -7,7 +8,8 @@ Wants=network-online.target
 
 [Service]
 EnvironmentFile=/etc/seki/env
-DynamicUser=yes
+User=seki
+Group=seki
 StateDirectory=seki
 NoNewPrivileges=yes
 ProtectSystem=strict

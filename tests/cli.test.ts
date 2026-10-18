@@ -40,6 +40,28 @@ async function seki(args: string[], env: Record<string, string | undefined> = {}
   return { code, out, err };
 }
 
+// The same environment as seki(), but the process is handed back so a test can signal it.
+function sekiProc(args: string[]) {
+  const env = { PATH: process.env.PATH ?? "", HOME: tempDir("seki-home-"), SEKI_URL: s.url, SEKI_TOKEN: s.token, SEKI_HOLDER: "tester" };
+  return Bun.spawn(["bun", entry, ...args], { env, stdout: "ignore", stderr: "ignore" });
+}
+
+// A proxy to the test server whose renews (every acquire after the first) fail with 502.
+function failingRenews() {
+  let acquires = 0;
+  const proxy = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(req) {
+      const u = new URL(req.url);
+      const body = req.method === "POST" ? await req.text() : undefined;
+      if (u.pathname === "/api/seki/acquire" && ++acquires > 1) return new Response("down", { status: 502 });
+      return fetch(s.url + u.pathname + u.search, { method: req.method, headers: req.headers, body });
+    },
+  });
+  return { url: `http://127.0.0.1:${proxy.port}`, stop: () => proxy.stop(true) };
+}
+
 type Lease = { resource: string; holder: string; mode: string; host: string; why: string; expires_at: number };
 async function ls(): Promise<Lease[]> {
   const r = await seki(["ls", "--json"]);
@@ -82,12 +104,14 @@ describe("acquire", () => {
   test("acquire without --holder or SEKI_HOLDER is refused: two callers would share one lease", async () => {
     const r = await seki(["acquire", "c5", "--shared"], { SEKI_HOLDER: undefined, USER: "frank" });
     expect(r.code).toBe(2);
-    expect(r.err).toContain("SEKI_HOLDER");
+    expect(r.err).toContain("set --holder or SEKI_HOLDER");
     expect((await ls()).some((x) => x.resource === "c5")).toBe(false);
   });
 
   test("release without --holder or SEKI_HOLDER is refused", async () => {
-    expect((await seki(["release", "c5"], { SEKI_HOLDER: undefined, USER: "frank" })).code).toBe(2);
+    const r = await seki(["release", "c5"], { SEKI_HOLDER: undefined, USER: "frank" });
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("set --holder or SEKI_HOLDER");
   });
 
   test("a holder in the config file is not used", async () => {
@@ -96,6 +120,7 @@ describe("acquire", () => {
     writeFileSync(join(home, ".config", "seki", "config.json"), JSON.stringify({ url: s.url, token: s.token, holder: "from-file" }));
     const p = Bun.spawn(["bun", entry, "acquire", "c5b", "--shared"], { env: { PATH: process.env.PATH ?? "", HOME: home, USER: "frank" }, stdout: "pipe", stderr: "pipe" });
     expect(await p.exited).toBe(2);
+    expect(await new Response(p.stderr).text()).toContain("SEKI_HOLDER");
   });
 
   test("--ttl above 7 days is a usage error", async () => {
@@ -141,7 +166,7 @@ describe("acquire", () => {
   test("a ttl under 3 seconds is a usage error", async () => {
     const r = await seki(["acquire", "c8", "--shared", "--ttl", "2s"]);
     expect(r.code).toBe(2);
-    expect(r.err).toContain("3");
+    expect(r.err).toContain("at least 3s");
   });
 });
 
@@ -201,8 +226,12 @@ describe("release and ls", () => {
 
   test("release only drops the caller's own lease", async () => {
     await seki(["acquire", "r2", "--shared"], { SEKI_HOLDER: "a" });
-    await seki(["release", "r2"], { SEKI_HOLDER: "b" });
-    expect((await ls()).some((x) => x.resource === "r2" && x.holder === "a")).toBe(true);
+    await seki(["acquire", "r2", "--shared"], { SEKI_HOLDER: "b" });
+    const r = await seki(["release", "r2"], { SEKI_HOLDER: "b" });
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("released r2");
+    const held = (await ls()).filter((x) => x.resource === "r2").map((x) => x.holder);
+    expect(held).toEqual(["a"]);
   });
 
   test("ls prints a table with a header and one row per lease", async () => {
@@ -256,11 +285,17 @@ describe("run", () => {
     expect((await running).code).toBe(0);
   });
 
-  test("two runs on the same host without SEKI_HOLDER do not share an exclusive lease", async () => {
+  test.each([
+    ["without SEKI_HOLDER", { SEKI_HOLDER: undefined, USER: "same" }],
+    ["with the same SEKI_HOLDER", { SEKI_HOLDER: "one-session" }],
+    ["with the same --holder", { SEKI_HOLDER: undefined, extra: ["--holder", "same-name"] }],
+  ] as const)("two runs %s do not share an exclusive lease", async (_, env) => {
     const marker = join(tempDir("seki-run-"), "started");
-    const first = seki(["run", "x8", "--exclusive", "--", "sh", "-c", `touch ${marker}; sleep 2`], { SEKI_HOLDER: undefined, USER: "same" });
+    const extra = "extra" in env ? [...env.extra] : [];
+    const e = { SEKI_HOLDER: env.SEKI_HOLDER, USER: "USER" in env ? env.USER : "u" };
+    const first = seki(["run", "x8", "--exclusive", ...extra, "--", "sh", "-c", `touch ${marker}; sleep 2`], e);
     for (let i = 0; i < 100 && !existsSync(marker); i++) await Bun.sleep(50);
-    const second = await seki(["run", "x8", "--exclusive", "--", "true"], { SEKI_HOLDER: undefined, USER: "same" });
+    const second = await seki(["run", "x8", "--exclusive", ...extra, "--", "true"], e);
     expect(second.code).toBe(124);
     expect((await first).code).toBe(0);
   });
@@ -274,24 +309,36 @@ describe("run", () => {
     expect(existsSync(marker)).toBe(false);
   });
 
-  test("a command exiting 1, 2, 124 or 125 on its own is passed through as is", async () => {
-    for (const c of [1, 2, 124, 125]) expect((await seki(["run", `x9-${c}`, "--shared", "--", "sh", "-c", `exit ${c}`])).code).toBe(c);
+  test("a command exiting with any of seki's own codes on its own is passed through as is", async () => {
+    for (const c of [1, 2, 123, 124, 125, 126, 127]) expect((await seki(["run", `x9-${c}`, "--shared", "--", "sh", "-c", `exit ${c}`])).code).toBe(c);
   });
 
-  test("when another holder takes the lease over, the command is stopped and run exits 124", async () => {
+  test.each([
+    ["missing", "/nonexistent/seki-test-cmd", 127],
+    ["not executable", "/etc/hostname", 126],
+  ])("a command that is %s (%s) exits %i and releases the lease", async (_, cmd, code) => {
+    const r = await seki(["run", `x14-${code}`, "--exclusive", "--", cmd]);
+    expect(r.code).toBe(code);
+    expect((await ls()).some((x) => x.resource === `x14-${code}`)).toBe(false);
+  });
+
+  test("when another holder takes the lease over, the command is stopped and run exits 123", async () => {
     const marker = join(tempDir("seki-run-"), "started");
-    const running = seki(["run", "x10", "--exclusive", "--ttl", "3s", "--holder", "victim", "--", "sh", "-c", `touch ${marker}; exec sleep 20`]);
+    const running = seki(["run", "x10", "--exclusive", "--ttl", "3s", "--", "sh", "-c", `touch ${marker}; sleep 20`]);
     for (let i = 0; i < 100 && !existsSync(marker); i++) await Bun.sleep(50);
-    await seki(["release", "x10"], { SEKI_HOLDER: "victim" });
+    const victim = (await ls()).find((x) => x.resource === "x10")!.holder;
+    await seki(["release", "x10"], { SEKI_HOLDER: victim });
     expect((await seki(["acquire", "x10", "--exclusive"], { SEKI_HOLDER: "thief" })).code).toBe(0);
     const started = Date.now();
     const r = await running;
-    expect(r.code).toBe(124);
+    expect(r.code).toBe(123);
     expect(r.err).toContain("thief");
     expect(Date.now() - started).toBeLessThan(4000);
   });
 
-  test("when renews keep failing until the lease has lapsed, the command is stopped and run exits 124", async () => {
+  test("a renew that the server answers by creating a new lease counts as lost", async () => {
+    // The proxy drops the lease just before forwarding each renew, so the server
+    // has nothing to renew and creates a fresh lease instead.
     let acquires = 0;
     const proxy = Bun.serve({
       hostname: "127.0.0.1",
@@ -299,32 +346,83 @@ describe("run", () => {
       async fetch(req) {
         const u = new URL(req.url);
         const body = req.method === "POST" ? await req.text() : undefined;
-        if (u.pathname === "/api/seki/acquire" && ++acquires > 1) return new Response("down", { status: 502 });
+        if (u.pathname === "/api/seki/acquire" && ++acquires > 1) {
+          const b = JSON.parse(body!) as { resource: string; holder: string };
+          await fetch(`${s.url}/api/seki/release`, { method: "POST", headers: req.headers, body: JSON.stringify({ resource: b.resource, holder: b.holder }) });
+        }
         return fetch(s.url + u.pathname + u.search, { method: req.method, headers: req.headers, body });
       },
     });
     try {
-      const started = Date.now();
-      const r = await seki(["run", "x11", "--exclusive", "--ttl", "3s", "--", "sleep", "20"], { SEKI_URL: `http://127.0.0.1:${proxy.port}` });
-      expect(r.code).toBe(124);
-      expect(Date.now() - started).toBeGreaterThanOrEqual(3000);
-      expect(Date.now() - started).toBeLessThan(8000);
+      const r = await seki(["run", "x15", "--exclusive", "--ttl", "3s", "--", "sleep", "20"], { SEKI_URL: `http://127.0.0.1:${proxy.port}` });
+      expect(r.code).toBe(123);
+      expect((await ls()).some((x) => x.resource === "x15")).toBe(false);
     } finally {
       proxy.stop(true);
     }
   });
 
-  test("SIGINT to seki alone is not forwarded: seki waits for the command, then releases", async () => {
-    const dir = tempDir("seki-run-");
-    const marker = join(dir, "started");
-    const done = join(dir, "done");
-    const home = tempDir("seki-home-");
-    const p = Bun.spawn(["bun", entry, "run", "x12", "--exclusive", "--", "sh", "-c", `touch ${marker}; sleep 1; touch ${done}`], { env: { PATH: process.env.PATH ?? "", HOME: home, SEKI_URL: s.url, SEKI_TOKEN: s.token, SEKI_HOLDER: "intr" }, stdout: "pipe", stderr: "pipe" });
+  test("losing the lease stops the whole command, background children and a SIGTERM-ignoring child included", async () => {
+    const proxy = failingRenews();
+    try {
+      const started = Date.now();
+      const r = await seki(["run", "x16", "--exclusive", "--ttl", "3s", "--", "sh", "-c", "sleep 22.3 & trap '' TERM; sleep 21.7"], { SEKI_URL: proxy.url, SEKI_KILL_AFTER_MS: "1000" });
+      expect(r.code).toBe(123);
+      expect(Date.now() - started).toBeLessThan(7000);
+      await Bun.sleep(300);
+      expect((await Bun.$`pgrep -f "sleep 2[12][.][37]"`.nothrow().quiet()).exitCode).toBe(1);
+    } finally {
+      proxy.stop();
+    }
+  });
+
+  test("when renews keep failing until the lease has lapsed, the command is stopped and run exits 123", async () => {
+    const proxy = failingRenews();
+    try {
+      const started = Date.now();
+      const r = await seki(["run", "x11", "--exclusive", "--ttl", "3s", "--", "sleep", "20"], { SEKI_URL: proxy.url });
+      expect(r.code).toBe(123);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(3000);
+      expect(Date.now() - started).toBeLessThan(8000);
+    } finally {
+      proxy.stop();
+    }
+  });
+
+  test("a renew that hangs does not keep the command running past the lease's expiry", async () => {
+    let acquires = 0;
+    const proxy = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      idleTimeout: 0,
+      async fetch(req) {
+        const u = new URL(req.url);
+        const body = req.method === "POST" ? await req.text() : undefined;
+        if (u.pathname === "/api/seki/acquire" && ++acquires > 1) await Bun.sleep(60_000);
+        return fetch(s.url + u.pathname + u.search, { method: req.method, headers: req.headers, body });
+      },
+    });
+    try {
+      const started = Date.now();
+      const r = await seki(["run", "x13", "--exclusive", "--ttl", "3s", "--", "sleep", "20"], { SEKI_URL: `http://127.0.0.1:${proxy.port}`, SEKI_TIMEOUT_MS: "15000" });
+      expect(r.code).toBe(123);
+      expect(Date.now() - started).toBeLessThan(5000);
+    } finally {
+      proxy.stop(true);
+    }
+  });
+
+  test.each([
+    ["SIGINT", 130],
+    ["SIGTERM", 143],
+    ["SIGHUP", 129],
+  ] as const)("%s sent to seki reaches the command, and the lease is released", async (sig, code) => {
+    const marker = join(tempDir("seki-run-"), "started");
+    const p = sekiProc(["run", `x12-${sig}`, "--exclusive", "--", "sh", "-c", `touch ${marker}; exec sleep 20`]);
     for (let i = 0; i < 100 && !existsSync(marker); i++) await Bun.sleep(50);
-    p.kill("SIGINT");
-    expect(await p.exited).toBe(0);
-    expect(existsSync(done)).toBe(true);
-    expect((await ls()).some((x) => x.resource === "x12")).toBe(false);
+    p.kill(sig);
+    expect(await p.exited).toBe(code);
+    expect((await ls()).some((x) => x.resource === `x12-${sig}`)).toBe(false);
   });
 
   test("a renew still in flight when the command ends does not bring the lease back after release", async () => {

@@ -27,7 +27,9 @@ describe("concurrent acquire", () => {
   test("shared and exclusive racing never end up holding together", async () => {
     for (let round = 0; round < 20; round++) {
       const res = `race-mix-${round}`;
-      const reqs = Array.from({ length: 5 }, (_, i) => [acquire(res, `s${i}`, "shared"), acquire(res, `x${i}`, "exclusive")]).flat();
+      // Shuffled so neither mode always goes out first.
+      const order = Array.from({ length: 5 }, (_, i) => [`shared:s${i}`, `exclusive:x${i}`]).flat().sort(() => Math.random() - 0.5);
+      const reqs = order.map((o) => acquire(res, o.split(":")[1]!, o.split(":")[0]!));
       const codes = (await Promise.all(reqs)).map((r) => r.status);
       expect(codes.every((c) => c === 200 || c === 409)).toBe(true);
       const held = (await leases()).filter((l) => l.resource === res);
@@ -57,9 +59,18 @@ describe("modes", () => {
   });
 
   test("the same holder asking again renews instead of conflicting with itself", async () => {
-    const first = (await (await acquire("m3", "a", "exclusive", 10)).json()) as { lease: { expires_at: number } };
-    const again = (await (await acquire("m3", "a", "exclusive", 3600)).json()) as { lease: { expires_at: number } };
+    const first = (await (await acquire("m3", "a", "exclusive", 10)).json()) as { renewed: boolean; lease: { expires_at: number } };
+    const again = (await (await acquire("m3", "a", "exclusive", 3600)).json()) as { renewed: boolean; lease: { expires_at: number } };
     expect(again.lease.expires_at - first.lease.expires_at).toBeGreaterThan(3000 * 1000);
+    expect(first.renewed).toBe(false);
+    expect(again.renewed).toBe(true);
+  });
+
+  test("asking again after the lease lapsed creates a new one and says so", async () => {
+    await acquire("m3b", "a", "exclusive", 1);
+    await Bun.sleep(1500);
+    const again = (await (await acquire("m3b", "a", "exclusive", 60)).json()) as { renewed: boolean };
+    expect(again.renewed).toBe(false);
   });
 
   test("a ttl of exactly 7 days is accepted", async () => {
@@ -98,6 +109,11 @@ describe("input", () => {
     [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: "60" }],
     [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 1e308 }],
     [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 604801 }],
+    [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 0.5 }],
+    [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 1.5 }],
+    [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, why: 3 }],
+    [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, host: "h".repeat(501) }],
+    [{ resource: "r".repeat(501), holder: "a", mode: "shared", ttl_sec: 60 }],
   ])("acquire rejects %j with 400", async (body) => {
     expect((await post("acquire", body)).status).toBe(400);
   });
