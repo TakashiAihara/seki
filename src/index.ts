@@ -164,7 +164,11 @@ async function acquire(cfg: Config, body: AcquireBody, limitMs = timeoutMs): Pro
   if (r.status === 200 && data.lease) return { lease: data.lease, renewed: data.renewed === true };
   if (r.status === 409 && data.held_by) return { heldBy: data.held_by };
   if (r.status === 410 && body.renew) return { gone: true };
-  if (r.status === 408) throw new Failure(2, "the server got the request after this client stopped waiting for it");
+  if (r.status === 408) {
+    const serverNow = parseReply<{ server_now?: number }>(r).server_now;
+    const skew = typeof serverNow === "number" ? `; server clock minus this host's: ${serverNow - Date.now()} ms` : "";
+    throw new Failure(2, `the server got the request after this client stopped waiting for it, or the two clocks differ${skew}`);
+  }
   throw new Failure(2, `server returned ${r.status}: ${r.text}`);
 }
 

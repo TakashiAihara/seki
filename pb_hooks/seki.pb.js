@@ -24,7 +24,7 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     // Taken inside the transaction: waiting for another one must not make an expired lease look live.
     const now = Date.now()
     if (b.not_after !== undefined && now > b.not_after) {
-      res = { status: 408, body: { ok: false, error: "the request arrived after its not_after" } }
+      res = { status: 408, body: { ok: false, server_now: now, error: "the request arrived after its not_after (check clock sync between client and server)" } }
       return
     }
     tx.db().newQuery("DELETE FROM leases WHERE expires_at < {:now}").bind({ now }).execute()

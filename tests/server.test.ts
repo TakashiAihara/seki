@@ -80,6 +80,7 @@ describe("modes", () => {
   test("a request that reaches the server after its not_after is refused with 408 and creates nothing", async () => {
     const late = await post("acquire", { resource: "m6", holder: "a", mode: "exclusive", ttl_sec: 60, not_after: Date.now() - 1 });
     expect(late.status).toBe(408);
+    expect(typeof ((await late.json()) as { server_now: unknown }).server_now).toBe("number");
     expect((await leases()).some((l) => l.resource === "m6")).toBe(false);
     const inTime = await post("acquire", { resource: "m6", holder: "a", mode: "exclusive", ttl_sec: 60, not_after: Date.now() + 5000 });
     expect(inTime.status).toBe(200);
