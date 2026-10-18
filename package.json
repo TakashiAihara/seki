@@ -5,8 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "bun test",
-    "typecheck": "tsc --noEmit",
-    "pretest": "sh scripts/fetch-pocketbase.sh"
+    "typecheck": "tsc --noEmit"
   },
   "repository": {
     "type": "git",

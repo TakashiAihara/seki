@@ -12,7 +12,7 @@ type Mode = "shared" | "exclusive";
 
 type Lease = { resource: string; holder: string; mode: Mode; host: string; why: string; expires_at: number };
 
-type FileConfig = { url?: string; token?: string; token_command?: string; holder?: string };
+type FileConfig = { url?: string; token?: string; token_command?: string };
 
 type Config = { url: string; token: string };
 
@@ -73,14 +73,22 @@ async function connect(file: FileConfig): Promise<Config> {
   return { url, token: await resolveToken(file) };
 }
 
-function resolveHolder(flag: string | undefined, file: FileConfig): string {
-  const holder = flag || process.env.SEKI_HOLDER || file.holder;
+// There is no default holder for acquire / renew / release: every session of the
+// same user on one host would share it, and the second exclusive acquire would
+// renew the first one's lease instead of being refused.
+function resolveHolder(flag: string | undefined): string {
+  const holder = flag || process.env.SEKI_HOLDER;
   if (holder) return holder;
-  // Without USER there is no identity to fall back to, so refuse instead of inventing one.
-  const user = process.env.USER;
-  if (!user) throw new Failure(2, "cannot pick a holder: set --holder, SEKI_HOLDER or USER");
-  return `${user}@${hostname()}`;
+  throw new Failure(2, "set --holder or SEKI_HOLDER: two callers with the same holder share one lease");
 }
+
+// run owns its lease from start to end, so a name unique to this invocation is safe.
+function runHolder(flag: string | undefined): string {
+  return flag || process.env.SEKI_HOLDER || `${process.env.USER || "unknown"}@${hostname()}#${crypto.randomUUID().slice(0, 8)}`;
+}
+
+const MAX_TTL_SEC = 7 * 24 * 3600;
+const MIN_TTL_SEC = 3;
 
 function modeOf(o: LeaseOpts): Mode {
   if (o.shared) return "shared";
@@ -92,21 +100,27 @@ function parseTtl(value: string): number {
   const m = /^([1-9]\d*)([smh]?)$/.exec(value);
   if (!m) throw new InvalidArgumentError(`takes 90s, 30m, 6h or a number of seconds, got "${value}"`);
   const unit = m[2] === "h" ? 3600 : m[2] === "m" ? 60 : 1;
-  return Number(m[1]) * unit;
+  const sec = Number(m[1]) * unit;
+  if (sec > MAX_TTL_SEC) throw new InvalidArgumentError(`is at most 7 days (168h), got "${value}"`);
+  // run renews every third of the ttl; below 3 s that is under a second apart and one failed renew lapses the lease.
+  if (sec < MIN_TTL_SEC) throw new InvalidArgumentError(`is at least ${MIN_TTL_SEC}s, got "${value}"`);
+  return sec;
 }
 
+const timeoutMs = Number(process.env.SEKI_TIMEOUT_MS) || 10_000;
+
 async function call(cfg: Config, method: "GET" | "POST", path: string, body?: unknown): Promise<Reply> {
-  let res: Response;
   try {
-    res = await fetch(cfg.url.replace(/\/+$/, "") + path, {
+    const res = await fetch(cfg.url.replace(/\/+$/, "") + path, {
       method,
       headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
     });
+    return { status: res.status, text: await res.text() };
   } catch (e) {
     throw new Failure(2, `server unreachable at ${cfg.url}: ${errText(e)}`);
   }
-  return { status: res.status, text: await res.text() };
 }
 
 function parseReply<T>(r: Reply): T {
@@ -181,9 +195,8 @@ function formatTable(leases: Lease[]): string {
 
 async function acquireCmd(resource: string, o: LeaseOpts): Promise<number> {
   const mode = modeOf(o);
-  const file = await loadFileConfig();
-  const holder = resolveHolder(o.holder, file);
-  const cfg = await connect(file);
+  const holder = resolveHolder(o.holder);
+  const cfg = await connect(await loadFileConfig());
   const r = await acquire(cfg, { resource, holder, mode, ttl_sec: o.ttl, host: hostname(), why: o.why });
   if ("heldBy" in r) throw new Failure(1, heldMessage(resource, r.heldBy));
   console.log(`acquired ${resource} ${mode} until ${new Date(r.lease.expires_at).toISOString()}`);
@@ -191,9 +204,8 @@ async function acquireCmd(resource: string, o: LeaseOpts): Promise<number> {
 }
 
 async function releaseCmd(resource: string, o: { holder?: string }): Promise<number> {
-  const file = await loadFileConfig();
-  const holder = resolveHolder(o.holder, file);
-  const cfg = await connect(file);
+  const holder = resolveHolder(o.holder);
+  const cfg = await connect(await loadFileConfig());
   const n = await release(cfg, resource, holder);
   console.log(n > 0 ? `released ${resource}` : `not held ${resource}`);
   return 0;
@@ -208,46 +220,72 @@ async function lsCmd(o: { json?: boolean }): Promise<number> {
 
 async function runCmd(resource: string, command: string[], o: LeaseOpts): Promise<number> {
   const mode = modeOf(o);
-  const file = await loadFileConfig();
-  const holder = resolveHolder(o.holder, file);
-  const cfg = await connect(file);
+  const holder = runHolder(o.holder);
+  const cfg = await connect(await loadFileConfig());
   const body: AcquireBody = { resource, holder, mode, ttl_sec: o.ttl, host: hostname(), why: o.why };
 
+  const sentAt = Date.now();
   const first = await acquire(cfg, body);
   if ("heldBy" in first) throw new Failure(1, heldMessage(resource, first.heldBy));
-
-  // A third of the ttl: one renew can fail and the next still lands before expiry.
-  const renew = setInterval(async () => {
-    try {
-      const r = await acquire(cfg, body);
-      if ("heldBy" in r) console.error(`warning: ${resource} was taken over by ${r.heldBy[0]?.holder}`);
-    } catch (e) {
-      console.error(`warning: renew ${resource} failed: ${errText(e)}`);
-    }
-  }, Math.max(1000, (o.ttl * 1000) / 3));
+  // Counted from when the request left, so a slow answer cannot make the lease look longer than it is.
+  let validUntil = sentAt + o.ttl * 1000;
 
   let child: Subprocess;
   try {
     child = Bun.spawn(command, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
   } catch (e) {
-    clearInterval(renew);
     await dropLease(cfg, resource, holder);
     throw new Failure(2, `cannot start ${command[0]}: ${errText(e)}`);
   }
 
-  // Forwarded so the child's own handlers see the signal; the lease is dropped only after it exits.
+  // Losing the lease stops the command: whoever holds it now was told the resource is theirs.
+  let lost: string | undefined;
+  const loseLease = (why: string) => {
+    if (lost) return;
+    lost = why;
+    console.error(`seki: lost the lease on ${resource}: ${why}; stopping the command`);
+    child.kill("SIGTERM");
+  };
+
+  // A third of the ttl: one renew can fail and the next still lands before expiry.
+  // Renews are chained so they never overlap, and the release waits for the last
+  // one: a renew still on the wire would otherwise recreate the lease after it.
+  let renewing: Promise<void> = Promise.resolve();
+  const renew = setInterval(() => {
+    renewing = renewing.then(async () => {
+      if (lost) return;
+      const sent = Date.now();
+      try {
+        const r = await acquire(cfg, body);
+        if ("heldBy" in r) return loseLease(heldMessage(resource, r.heldBy));
+        validUntil = sent + o.ttl * 1000;
+      } catch (e) {
+        if (Date.now() >= validUntil) return loseLease(`renew failed until the lease lapsed (${errText(e)})`);
+        console.error(`warning: renew ${resource} failed: ${errText(e)}`);
+      }
+    });
+  }, (o.ttl * 1000) / 3);
+
+  // A Ctrl-C from the terminal already reaches the child (same process group), so SIGINT is
+  // not forwarded; seki only stays alive to release after the child exits. SIGTERM and SIGHUP
+  // are addressed to seki alone and are passed on.
+  const ignore = () => {};
   const forward = (sig: NodeJS.Signals) => child.kill(sig);
-  process.on("SIGINT", forward);
+  process.on("SIGINT", ignore);
   process.on("SIGTERM", forward);
+  process.on("SIGHUP", forward);
   try {
     await child.exited;
   } finally {
     clearInterval(renew);
-    process.off("SIGINT", forward);
+    process.off("SIGINT", ignore);
     process.off("SIGTERM", forward);
+    process.off("SIGHUP", forward);
+    await renewing;
     await dropLease(cfg, resource, holder);
   }
 
+  if (lost) throw new Failure(1, "");
   const code = child.exitCode;
   if (code !== null) return code;
   const sig = child.signalCode;
@@ -255,8 +293,10 @@ async function runCmd(resource: string, command: string[], o: LeaseOpts): Promis
   return 128 + constants.signals[sig];
 }
 
+const valueOptions = new Set(["--holder", "--ttl", "--why"]);
+
 function addHolder(c: Command): Command {
-  return c.option("--holder <name>", "holder name; default $SEKI_HOLDER, then the config file, then $USER@host");
+  return c.option("--holder <name>", "holder name; default $SEKI_HOLDER");
 }
 
 function addLeaseOptions(c: Command): Command {
@@ -264,7 +304,7 @@ function addLeaseOptions(c: Command): Command {
     .addOption(new Option("--shared", "several shared holders may coexist").conflicts("exclusive"))
     .addOption(new Option("--exclusive", "no other holder while this one is held").conflicts("shared"))
     .addOption(
-      new Option("--ttl <duration>", "90s, 30m, 6h or a number of seconds").argParser(parseTtl).default(3600, "1h"),
+      new Option("--ttl <duration>", "90s, 30m, 6h or a number of seconds").argParser(parseTtl).default(600, "10m"),
     )
     .option("--why <text>", "reason shown to other holders");
 }
@@ -281,8 +321,7 @@ async function main(argv: string[]): Promise<number> {
   const lease = async (resource: string, o: LeaseOpts) => {
     code = await acquireCmd(resource, o);
   };
-  addLeaseOptions(program.command("acquire").description("take a lease").argument("<resource>")).action(lease);
-  addLeaseOptions(program.command("renew").description("extend a lease you hold").argument("<resource>")).action(lease);
+  addLeaseOptions(program.command("acquire").description("take a lease, or extend your own").argument("<resource>")).action(lease);
 
   addHolder(program.command("release").description("drop a lease you hold").argument("<resource>")).action(
     async (resource: string, o: { holder?: string }) => {
@@ -290,7 +329,7 @@ async function main(argv: string[]): Promise<number> {
     },
   );
 
-  addHolder(program.command("ls").description("list live leases"))
+  program.command("ls").description("list live leases")
     .option("--json", "print the leases as JSON")
     .action(async (o: { json?: boolean }) => {
       code = await lsCmd(o);
@@ -299,18 +338,26 @@ async function main(argv: string[]): Promise<number> {
   addLeaseOptions(
     program.command("run").description("hold a lease while a command runs").argument("<resource>").argument("<command...>"),
   ).action(async (resource: string, command: string[], o: LeaseOpts) => {
-    // Commander drops the -- separator, so it is checked against argv to refuse a command given without it.
-    if (!argv.includes("--")) throw new Failure(2, "put -- before the command: seki run <resource> --shared -- <command>");
+    // Commander drops the -- separator. The command must be exactly what follows the first
+    // bare -- that is not the value of an option taking one (--why -- reads "--" as the reason).
+    let sep = argv.indexOf("--");
+    while (sep > 0 && valueOptions.has(argv[sep - 1]!)) sep = argv.indexOf("--", sep + 1);
+    if (sep < 0 || argv.slice(sep + 1).join("\0") !== command.join("\0")) {
+      throw new Failure(2, "put -- before the command: seki run <resource> --shared -- <command>");
+    }
     code = await runCmd(resource, command, o);
   });
 
+  // run passes the command's exit code through, so its own outcomes move out of the way:
+  // 124 = held or lost (as timeout(1) uses 124), 125 = seki failed (as env(1) uses 125).
+  const own = (c: number) => (argv[0] !== "run" || c === 0 ? c : c === 1 ? 124 : 125);
   try {
     await program.parseAsync(argv, { from: "user" });
   } catch (e) {
-    if (e instanceof CommanderError) return e.exitCode === 0 ? 0 : 2;
+    if (e instanceof CommanderError) return own(e.exitCode === 0 ? 0 : 2);
     if (e instanceof Failure) {
       if (e.message) console.error(e.message);
-      return e.code;
+      return own(e.code);
     }
     throw e;
   }

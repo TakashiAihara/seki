@@ -9,7 +9,7 @@ function authorize(e) {
   if (token === "") {
     return { status: 503, body: { ok: false, error: "SEKI_TOKEN is not set on the server" } }
   }
-  if (e.request.header.get("Authorization") !== "Bearer " + token) {
+  if (!$security.equal(e.request.header.get("Authorization"), "Bearer " + token)) {
     return { status: 401, body: { ok: false, error: "missing or wrong bearer token" } }
   }
   return null
@@ -19,4 +19,13 @@ function lease(o) {
   return { resource: o.get("resource"), holder: o.get("holder"), mode: o.get("mode"), host: o.get("host"), why: o.get("why"), expires_at: o.get("expires_at") }
 }
 
-module.exports = { authorize, lease }
+const MAX_TTL_SEC = 7 * 24 * 3600
+
+function validAcquire(b) {
+  return typeof b.resource === "string" && b.resource !== "" &&
+    typeof b.holder === "string" && b.holder !== "" &&
+    (b.mode === "shared" || b.mode === "exclusive") &&
+    typeof b.ttl_sec === "number" && Number.isFinite(b.ttl_sec) && b.ttl_sec > 0 && b.ttl_sec <= MAX_TTL_SEC
+}
+
+module.exports = { authorize, lease, validAcquire }

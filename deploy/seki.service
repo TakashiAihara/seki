@@ -7,6 +7,11 @@ Wants=network-online.target
 
 [Service]
 EnvironmentFile=/etc/seki/env
+DynamicUser=yes
+StateDirectory=seki
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
 WorkingDirectory=/opt/seki
 ExecStart=/opt/seki/bin/pocketbase serve --dir /var/lib/seki --hooksDir /opt/seki/pb_hooks --hooksWatch=false --migrationsDir /opt/seki/pb_migrations --http 0.0.0.0:8090
 Restart=on-failure

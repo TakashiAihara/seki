@@ -9,8 +9,8 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
   if (denied) return e.json(denied.status, denied.body)
 
   const b = e.requestInfo().body
-  if (!b.resource || !b.holder || !["shared", "exclusive"].includes(b.mode) || !(b.ttl_sec > 0)) {
-    return e.json(400, { ok: false, error: "resource, holder, mode (shared|exclusive) and ttl_sec > 0 are required" })
+  if (!seki.validAcquire(b)) {
+    return e.json(400, { ok: false, error: "resource and holder (strings), mode (shared|exclusive) and ttl_sec (number, 1 to 604800) are required" })
   }
 
   const now = Date.now()
@@ -45,8 +45,8 @@ routerAdd("POST", "/api/seki/release", (e) => {
   if (denied) return e.json(denied.status, denied.body)
 
   const b = e.requestInfo().body
-  if (!b.resource || !b.holder) {
-    return e.json(400, { ok: false, error: "resource and holder are required" })
+  if (typeof b.resource !== "string" || typeof b.holder !== "string") {
+    return e.json(400, { ok: false, error: "resource and holder (strings) are required" })
   }
   const r = $app.db().newQuery("DELETE FROM leases WHERE resource = {:r} AND holder = {:h}").bind({ r: b.resource, h: b.holder }).execute()
   return e.json(200, { ok: true, released: r.rowsAffected() })

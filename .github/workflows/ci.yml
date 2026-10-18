@@ -26,5 +26,6 @@ jobs:
         run: grep -qx 'bun = "1.4.0"' .mise.toml
 
       - run: bun install --frozen-lockfile
+      - run: sh scripts/fetch-pocketbase.sh
       - run: bun run typecheck
       - run: bun test

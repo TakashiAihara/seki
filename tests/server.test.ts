@@ -12,7 +12,7 @@ afterAll(async () => {
 const post = (path: string, body: unknown, token = s.token) =>
   fetch(`${s.url}/api/seki/${path}`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
 const acquire = (resource: string, holder: string, mode: string, ttl_sec = 60) => post("acquire", { resource, holder, mode, ttl_sec, host: "h", why: `why-${holder}` });
-const leases = async () => ((await (await fetch(`${s.url}/api/seki/leases`, { headers: { authorization: `Bearer ${s.token}` } })).json()) as { leases: { resource: string; holder: string }[] }).leases;
+const leases = async () => ((await (await fetch(`${s.url}/api/seki/leases`, { headers: { authorization: `Bearer ${s.token}` } })).json()) as { leases: { resource: string; holder: string; mode: string }[] }).leases;
 
 describe("concurrent acquire", () => {
   test("ten exclusive acquires at once let exactly one through, every round", async () => {
@@ -28,9 +28,11 @@ describe("concurrent acquire", () => {
     for (let round = 0; round < 20; round++) {
       const res = `race-mix-${round}`;
       const reqs = Array.from({ length: 5 }, (_, i) => [acquire(res, `s${i}`, "shared"), acquire(res, `x${i}`, "exclusive")]).flat();
-      await Promise.all(reqs);
+      const codes = (await Promise.all(reqs)).map((r) => r.status);
+      expect(codes.every((c) => c === 200 || c === 409)).toBe(true);
       const held = (await leases()).filter((l) => l.resource === res);
-      const exclusive = held.filter((l) => l.holder.startsWith("x"));
+      expect(held).toHaveLength(codes.filter((c) => c === 200).length);
+      const exclusive = held.filter((l) => l.mode === "exclusive");
       expect(held.length).toBeGreaterThan(0);
       if (exclusive.length > 0) expect(held).toHaveLength(1);
     }
@@ -60,6 +62,10 @@ describe("modes", () => {
     expect(again.lease.expires_at - first.lease.expires_at).toBeGreaterThan(3000 * 1000);
   });
 
+  test("a ttl of exactly 7 days is accepted", async () => {
+    expect((await acquire("m5", "a", "shared", 604800)).status).toBe(200);
+  });
+
   test("release frees the resource and reports what it removed", async () => {
     await acquire("m4", "a", "exclusive");
     const r = (await (await post("release", { resource: "m4", holder: "a" })).json()) as { released: number };
@@ -87,6 +93,11 @@ describe("input", () => {
     [{ resource: "i1", mode: "shared", ttl_sec: 60 }],
     [{ resource: "i1", holder: "a", mode: "both", ttl_sec: 60 }],
     [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 0 }],
+    [{ resource: { x: 1 }, holder: "a", mode: "shared", ttl_sec: 60 }],
+    [{ resource: "i1", holder: 7, mode: "shared", ttl_sec: 60 }],
+    [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: "60" }],
+    [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 1e308 }],
+    [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 604801 }],
   ])("acquire rejects %j with 400", async (body) => {
     expect((await post("acquire", body)).status).toBe(400);
   });
@@ -100,7 +111,9 @@ describe("auth", () => {
   });
 
   test("the lease records are not readable through PocketBase's own record API", async () => {
-    expect((await fetch(`${s.url}/api/collections/leases/records`)).status).not.toBe(200);
+    expect((await fetch(`${s.url}/api/collections/leases/records`)).status).toBe(403);
+    const create = await fetch(`${s.url}/api/collections/leases/records`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ resource: "z", holder: "z", mode: "exclusive", expires_at: 9e12 }) });
+    expect(create.status).toBe(403);
   });
 
   test("a server started without SEKI_TOKEN refuses everything", async () => {

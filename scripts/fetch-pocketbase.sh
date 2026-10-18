@@ -16,4 +16,6 @@ curl -fsSL -o "$tmp/checksums.txt" "$base/checksums.txt"
 if command -v sha256sum >/dev/null 2>&1; then sum="sha256sum -c -"; else sum="shasum -a 256 -c -"; fi
 (cd "$tmp" && grep " $name\$" checksums.txt | $sum >/dev/null) || { echo "checksum mismatch for $name" >&2; exit 1; }
 mkdir -p "$root/bin"
-unzip -oq "$tmp/$name" pocketbase -d "$root/bin"
+unzip -oq "$tmp/$name" pocketbase -d "$tmp"
+# rename, not overwrite: the running server keeps its old binary open (ETXTBSY otherwise)
+mv -f "$tmp/pocketbase" "$root/bin/pocketbase"
