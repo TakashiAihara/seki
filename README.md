@@ -79,7 +79,7 @@ SEKI_TOKEN=<shared token> bin/pocketbase serve --dir /var/lib/seki --hooksDir pb
 - Trust model: anyone with the token can take, extend and release any lease. The holder is a name the client sends, not an identity the server checks; it keeps honest callers apart, not hostile ones.
 - The server speaks plain HTTP. Put it behind TLS if the token should not cross the network in the clear.
 - The server applies the migrations in `pb_migrations/` on start, so updating the checkout and restarting can change the schema.
-- The PocketBase admin UI (`/_/`) shows the `leases` collection and is the dashboard. Create the first superuser as the service's user, so the data files stay owned by it: `runuser -u seki -- bin/pocketbase superuser upsert <email> <password> --dir /var/lib/seki`.
+- The PocketBase admin UI (`/_/`) shows the `leases` collection and is the dashboard. Superuser login alerts ("login from a new location" mail) are turned off by a migration: the server is not set up to send mail, and each alert left a `sendmail` process retrying. Create the first superuser as the service's user, so the data files stay owned by it: `runuser -u seki -- bin/pocketbase superuser upsert <email> <password> --dir /var/lib/seki`.
 - `deploy/seki.service` runs the server as the system user `seki` with the data in `/var/lib/seki`; `deploy/update.sh` brings `/opt/seki` to `origin/main` and restarts it.
 - The lease records are not readable through PocketBase's own record API; only the routes below serve them.
 
