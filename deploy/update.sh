@@ -5,6 +5,9 @@ cd /opt/seki
 git fetch -q origin
 git checkout -q --detach origin/main
 sh scripts/fetch-pocketbase.sh
+# The unit is part of the checkout, so it is brought along before the restart.
+install -m 644 deploy/seki.service /etc/systemd/system/seki.service
+systemctl daemon-reload
 systemctl restart seki
 # /api/health answers even when the hooks failed to load; an unauthenticated call to a
 # seki route answers 401 only when they did.
