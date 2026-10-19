@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 const root = join(import.meta.dir, "..", "..");
 
-export type Server = { url: string; token: string; stop: () => Promise<void> };
+export type Server = { url: string; token: string; binary: string; dataDir: string; stop: () => Promise<void> };
 
 // Starts the real PocketBase with this repo's hooks and migrations on a free
 // port and a throwaway data dir. Bound to 127.0.0.1: a test server is never
@@ -38,6 +38,8 @@ export async function startServer(opts: { token?: string | null } = {}): Promise
   return {
     url,
     token: token ?? "",
+    binary,
+    dataDir: join(dir, "pb_data"),
     stop: async () => {
       proc.kill();
       await proc.exited;

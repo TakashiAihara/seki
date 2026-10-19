@@ -161,6 +161,17 @@ describe("auth", () => {
     expect(create.status).toBe(403);
   });
 
+  test("superuser login alerts are off: the server has no way to send mail", async () => {
+    const pw = "pw-" + crypto.randomUUID();
+    const up = Bun.spawn([s.binary, "superuser", "upsert", "admin@example.test", pw, "--dir", s.dataDir], { stdout: "ignore", stderr: "ignore" });
+    expect(await up.exited).toBe(0);
+    const auth = await fetch(`${s.url}/api/collections/_superusers/auth-with-password`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ identity: "admin@example.test", password: pw }) });
+    expect(auth.status).toBe(200);
+    const token = ((await auth.json()) as { token: string }).token;
+    const col = (await (await fetch(`${s.url}/api/collections/_superusers`, { headers: { Authorization: token } })).json()) as { authAlert: { enabled: boolean } };
+    expect(col.authAlert.enabled).toBe(false);
+  });
+
   test("a server started without SEKI_TOKEN refuses everything", async () => {
     const bare = await startServer({ token: null });
     try {

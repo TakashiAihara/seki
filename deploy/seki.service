@@ -14,6 +14,9 @@ StateDirectory=seki
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
+# No mail is set up. Hiding sendmail makes every PocketBase mail (login alerts, password
+# reset, verification, OTP) fail at once instead of leaving a sendmail process retrying.
+InaccessiblePaths=-/usr/sbin/sendmail -/usr/bin/sendmail -/usr/lib/sendmail
 WorkingDirectory=/opt/seki
 ExecStart=/opt/seki/bin/pocketbase serve --dir /var/lib/seki --hooksDir /opt/seki/pb_hooks --hooksWatch=false --migrationsDir /opt/seki/pb_migrations --http 0.0.0.0:8090
 Restart=on-failure
