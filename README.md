@@ -23,9 +23,9 @@ seki run <resource> (--shared | --exclusive) [--ttl <duration>] [--why <text>] [
 - To renew, `acquire` again with the same holder. It replaces the caller's own lease (mode, ttl and reason), so it can also move a shared lease to exclusive when nobody else holds the resource.
 - `--wait <duration>` (same format, up to 7 days) waits for a held resource instead of giving up at once. The caller joins the resource's queue, asks again every second, prints its place in the queue to stderr when it changes, and takes the lease when its turn comes. Past the duration it leaves the queue and exits as if it had not waited (1, or 124 for `run`).
 - The queue is first come, first served. A request waits behind every waiter that came before it and would conflict with it (either side exclusive), so a shared request does not pass an exclusive one that is waiting, even while only shared holders hold the resource. Shared waiters with no exclusive one ahead go in together. A request without `--wait` comes after everyone waiting. A holder renewing its own lease is never held up by the queue.
-- While waiting, an unreachable server is asked again until the wait runs out; any other server error ends the wait with exit 2 (125 for `run`).
+- While waiting, once the server has answered, an unreachable server or a gateway error (502 / 504) is asked again until the wait runs out; any other error ends the wait with exit 2 (125 for `run`). A server that is down longer than the waiter's 40 seconds forgets the queue, and whoever asks first after it comes back goes first.
 - A waiter that stops asking (killed, or a Ctrl-C while waiting) drops out of the queue about 40 seconds later (2 × `SEKI_TIMEOUT_MS` + 21 s).
-- Moving your own shared lease to exclusive waits in the queue like a new request. Two shared holders that both wait to move to exclusive wait for each other until one of them gives up (its `--wait` runs out) or its shared lease expires.
+- A holder is ahead of the queue, also when it moves its shared lease to exclusive: it gets exclusive as soon as no other holder holds the resource. Two shared holders that both wait to move to exclusive block each other through their shared leases until one of them releases its lease or the lease expires; giving up the wait alone does not end it.
 - `ls` prints the live leases, then (when anyone waits) the queue: resource, place, mode, holder, host, how long it has waited, why. `ls --json` prints `{"leases": [...], "waiting": [...]}`.
 - `release` drops only the caller's own lease. Releasing something you do not hold prints `not held <resource>` and exits 0.
 - `run` takes the lease, runs the command, renews the lease in the background every third of the TTL, and releases it when the command ends, however it ends. If the lease cannot be taken the command is not started.
@@ -95,11 +95,12 @@ All routes need `Authorization: Bearer <SEKI_TOKEN>`.
 
 | route | body | answer |
 | --- | --- | --- |
-| `POST /api/seki/acquire` | `{resource, holder, mode, ttl_sec (integer, 1 to 604800), host?, why?, renew?, not_after? (Unix ms)}`; strings up to 500 characters | 200 `{ok, renewed, lease}` (`renewed` is true when the holder's live lease was extended, false when a new one was created) / 409 `{ok: false, held_by: [lease...]}` / 410 when `renew: true` and the holder has no live lease (nothing is created) / 408 when processed after `not_after` (nothing is created) / 400 |
+| `POST /api/seki/acquire` | `{resource, holder, mode, ttl_sec (integer, 1 to 604800), host?, why?, renew?, not_after? (Unix ms), queue_ttl_sec? (integer, 1 to 3600)}`; strings up to 500 characters | 200 `{ok, renewed, lease}` (`renewed` is true when the holder's live lease was extended, false when a new one was created) / 409 `{ok: false, held_by: [lease...], waiting: [waiter...], queued, position?}` (`waiting` lists the waiters ahead of the request; with `queue_ttl_sec` and without `renew` the caller is put in or kept in the queue until then, `queued` is true and `position` is its place) / 410 when `renew: true` and the holder has no live lease (nothing is created) / 408 when processed after `not_after` (nothing is created) / 400 |
 | `POST /api/seki/release` | `{resource, holder}` | 200 `{ok, released: <rows>}` |
-| `GET /api/seki/leases` | | 200 `{ok, leases: [lease...]}` (expired leases are left out) |
+| `POST /api/seki/unqueue` | `{resource, holder}` | 200 `{ok, unqueued: <rows>}` (leaves the queue; a lease the caller holds is kept) |
+| `GET /api/seki/leases` | | 200 `{ok, leases: [lease...], waiting: [waiter...]}` (expired leases and waiters are left out; waiters by resource, in queue order) |
 
-A lease is `{resource, holder, mode, host, why, expires_at}`, `expires_at` in Unix milliseconds.
+A lease is `{resource, holder, mode, host, why, expires_at}`, a waiter `{resource, holder, mode, host, why, queued_at, expires_at, position}`; times in Unix milliseconds.
 
 ## Development
 

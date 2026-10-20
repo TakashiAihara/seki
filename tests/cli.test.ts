@@ -645,7 +645,7 @@ describe("--wait", () => {
     const started = performance.now();
     const r = await seki(["acquire", "w2", "--exclusive", "--wait", "3s"], { SEKI_HOLDER: "next" });
     expect(r.code).toBe(1);
-    expect(performance.now() - started).toBeGreaterThan(1500);
+    expect(performance.now() - started).toBeGreaterThan(2900);
     expect(performance.now() - started).toBeLessThan(8000);
     expect(r.err).toContain("owner");
     expect(await waitingFor("w2")).toEqual([]);
@@ -731,6 +731,42 @@ describe("--wait", () => {
     } finally {
       proxy.stop(true);
     }
+  });
+
+  test("a gateway error while waiting is retried too", async () => {
+    await seki(["acquire", "w10", "--exclusive"], { SEKI_HOLDER: "owner" });
+    let acquires = 0;
+    const proxy = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(req) {
+        const u = new URL(req.url);
+        const body = req.method === "POST" ? await req.text() : undefined;
+        if (u.pathname === "/api/seki/acquire" && ++acquires === 2) return new Response("bad gateway", { status: 502 });
+        return fetch(s.url + u.pathname + u.search, { method: req.method, headers: req.headers, body });
+      },
+    });
+    try {
+      const waiting = seki(["acquire", "w10", "--exclusive", "--wait", "30s"], { SEKI_HOLDER: "next", SEKI_URL: `http://127.0.0.1:${proxy.port}` });
+      while (acquires < 3) await Bun.sleep(100);
+      await seki(["release", "w10"], { SEKI_HOLDER: "owner" });
+      const r = await waiting;
+      expect(r.code).toBe(0);
+      expect(r.err).toContain("502");
+    } finally {
+      proxy.stop(true);
+    }
+  });
+
+  test.each([
+    ["a wrong token", { SEKI_TOKEN: "wrong" }],
+    ["an address nothing listens on", { SEKI_URL: "http://127.0.0.1:1" }],
+  ])("--wait with %s ends at once with exit 2", async (_, env) => {
+    await seki(["acquire", "w11", "--exclusive"], { SEKI_HOLDER: "owner" });
+    const started = performance.now();
+    const r = await seki(["acquire", "w11", "--exclusive", "--wait", "30s"], { SEKI_HOLDER: "next", ...env });
+    expect(r.code).toBe(2);
+    expect(performance.now() - started).toBeLessThan(10_000);
   });
 
   test.each(["0", "0s", "169h", "soon"])("--wait %s is a usage error", async (v) => {

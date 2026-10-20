@@ -39,20 +39,20 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     const mine = tx.findRecordsByFilter("leases", "resource = {:r} && holder = {:h}", "", 1, 0, { r: b.resource, h: b.holder })
     const renewed = mine.length > 0
 
-    // A holder renewing is ahead of everyone waiting; moving a shared lease to exclusive is
-    // not a renew and waits its turn. Anyone else comes after the waiters queued before it; a
-    // request that does not queue comes after all of them, so it cannot take the resource from
-    // under the queue the moment it frees up (it still goes in with shared waiters when it is
-    // shared too). A renew (renew: true) never queues: a lapsed one gets 410 below.
-    const keeping = renewed && !(b.mode === "exclusive" && mine[0].get("mode") === "shared")
+    // A holder is ahead of everyone waiting, also when it moves its shared lease to exclusive:
+    // the waiters need it to let go anyway, so making it wait for them would leave both waiting.
+    // Anyone else comes after the waiters queued before it; a request that does not queue comes
+    // after all of them, so it cannot take the resource from under the queue the moment it frees
+    // up (it still goes in with shared waiters when it is shared too). A renew (renew: true)
+    // never queues: a lapsed one gets 410 below.
     const queue = tx.findRecordsByFilter("waiters", "resource = {:r}", "queued_at,id", 0, 0, { r: b.resource })
     const at = queue.findIndex((w) => w.get("holder") === b.holder)
-    const ahead = keeping || b.renew === true ? [] : at < 0 ? queue : queue.slice(0, at)
+    const ahead = renewed || b.renew === true ? [] : at < 0 ? queue : queue.slice(0, at)
     const waitingFor = ahead.filter((w) => seki.blockedByWaiter(b.mode, w.get("mode")))
 
     if (blocking.length > 0 || waitingFor.length > 0) {
       const body = { ok: false, held_by: blocking.map(seki.lease), waiting: ahead.map((w, i) => seki.waiter(w, i + 1)), queued: false }
-      if (b.queue_ttl_sec !== undefined) {
+      if (b.queue_ttl_sec !== undefined && b.renew !== true) {
         const w = at >= 0 ? queue[at] : new Record(tx.findCollectionByNameOrId("waiters"))
         if (at < 0) {
           w.set("resource", b.resource)

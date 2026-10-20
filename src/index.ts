@@ -169,6 +169,8 @@ type AcquireResult = { lease: Lease; renewed: boolean } | { heldBy: Lease[]; wai
 async function acquire(cfg: Config, body: AcquireBody, limitMs = timeoutMs): Promise<AcquireResult> {
   // The server drops a request it sees after we stopped waiting, so giving up never leaves a lease behind.
   const r = await call(cfg, "POST", "/api/seki/acquire", { ...body, not_after: Date.now() + Math.ceil(limitMs) }, limitMs);
+  // A proxy in front of a restarting server; worth asking again while waiting.
+  if (r.status === 502 || r.status === 504) throw new Unreachable(`server returned ${r.status}: ${r.text}`);
   const data = parseReply<{ lease?: Lease; renewed?: boolean; held_by?: Lease[]; waiting?: Waiter[]; position?: number }>(r);
   // run needs to know a renew from a fresh lease; a server that does not say is too old to trust with it.
   if (r.status === 200 && data.lease && typeof data.renewed !== "boolean") {
@@ -226,6 +228,8 @@ async function acquireWaiting(cfg: Config, body: AcquireBody, waitMs: number): P
   const until = performance.now() + waitMs;
   const queued = { ...body, queue_ttl_sec: queueTtlSec() };
   let shown: number | undefined;
+  let answered = false;
+  let failing = false;
   try {
     for (;;) {
       const sentAt = performance.now();
@@ -233,13 +237,17 @@ async function acquireWaiting(cfg: Config, body: AcquireBody, waitMs: number): P
       try {
         result = await acquire(cfg, queued);
       } catch (e) {
-        // A wait can last hours; one dropped connection should not end it. Other failures
-        // (token, clock, server errors) would fail every time and end it at once.
-        if (!(e instanceof Unreachable) || performance.now() >= until) throw e;
-        console.error(`warning: ${e.message}; asking again`);
+        // A wait can last hours; a dropped connection or a server restart behind a proxy should
+        // not end it. Before the first answer the address may simply be wrong, and other errors
+        // (token, clock, usage) are not ones that clear up, so those end the wait at once.
+        if (!answered || !(e instanceof Unreachable) || performance.now() >= until) throw e;
+        if (!failing) console.error(`warning: ${e.message}; asking again`);
+        failing = true;
         await Bun.sleep(Math.min(POLL_MS, until - performance.now()));
         continue;
       }
+      answered = true;
+      failing = false;
       if (!("heldBy" in result)) return { result, sentAt };
       if (performance.now() >= until) {
         await unqueue(cfg, body.resource, body.holder);
