@@ -38,15 +38,17 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     const mine = tx.findRecordsByFilter("leases", "resource = {:r} && holder = {:h}", "", 1, 0, { r: b.resource, h: b.holder })
     const renewed = mine.length > 0
 
-    // The holder renewing is ahead of everyone waiting. Anyone else waits behind the waiters
-    // queued before it; a request that does not queue waits behind all of them, so it cannot
-    // take the resource from under the queue the moment it frees up. A renew (renew: true)
-    // never queues: a lapsed one gets 410 below.
+    // The holder renewing is ahead of everyone waiting, and is not held up by other holders
+    // either: those exist only as shared co-holders left from before leases were all exclusive,
+    // and refusing their renews would stop their running commands. Anyone else waits behind the
+    // waiters queued before it; a request that does not queue waits behind all of them, so it
+    // cannot take the resource from under the queue the moment it frees up. A renew
+    // (renew: true) never queues: a lapsed one gets 410 below.
     const queue = tx.findRecordsByFilter("waiters", "resource = {:r}", "queued_at,id", 0, 0, { r: b.resource })
     const at = queue.findIndex((w) => w.get("holder") === b.holder)
     const ahead = renewed || b.renew === true ? [] : at < 0 ? queue : queue.slice(0, at)
 
-    if (others.length > 0 || ahead.length > 0) {
+    if ((!renewed && others.length > 0) || ahead.length > 0) {
       const body = { ok: false, held_by: others.map(seki.lease), waiting: ahead.map((w, i) => seki.waiter(w, i + 1)), queued: false }
       if (b.queue_ttl_sec !== undefined && b.renew !== true) {
         const w = at >= 0 ? queue[at] : new Record(tx.findCollectionByNameOrId("waiters"))
@@ -74,7 +76,6 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     const rec = renewed ? mine[0] : new Record(tx.findCollectionByNameOrId("leases"))
     rec.set("resource", b.resource)
     rec.set("holder", b.holder)
-
     rec.set("host", b.host || "")
     rec.set("why", b.why || "")
     rec.set("expires_at", now + b.ttl_sec * 1000)

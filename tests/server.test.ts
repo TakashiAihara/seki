@@ -171,6 +171,16 @@ describe("queue", () => {
     expect((await leases()).some((l) => l.resource === "q6" && l.holder === "a")).toBe(true);
   });
 
+  test("ls numbers each resource's queue on its own", async () => {
+    for (const r of ["q12a", "q12b"]) {
+      await acquire(r, "h");
+      await wait(r, "p");
+      await wait(r, "q");
+    }
+    const got = (await waiting()).filter((w) => w.resource.startsWith("q12")).map((w) => [w.resource, w.holder, w.position]);
+    expect(got).toEqual([["q12a", "p", 1], ["q12a", "q", 2], ["q12b", "p", 1], ["q12b", "q", 2]]);
+  });
+
   test("ten callers queueing at once get positions 1 to 10", async () => {
     await acquire("q7", "a");
     const answers = await Promise.all(Array.from({ length: 10 }, (_, i) => wait("q7", `w${i}`).then(refusal)));
@@ -196,7 +206,6 @@ describe("input", () => {
   test.each([
     [{ holder: "a", ttl_sec: 60 }],
     [{ resource: "i1", ttl_sec: 60 }],
-
     [{ resource: "i1", holder: "a", ttl_sec: 0 }],
     [{ resource: { x: 1 }, holder: "a", ttl_sec: 60 }],
     [{ resource: "i1", holder: 7, ttl_sec: 60 }],

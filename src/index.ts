@@ -99,7 +99,6 @@ function runHolder(flag: string | undefined): string {
 const MAX_TTL_SEC = 7 * 24 * 3600;
 const MIN_TTL_SEC = 3;
 
-
 function parseDuration(value: string): number {
   const m = /^([1-9]\d*)([smh]?)$/.exec(value);
   if (!m) throw new InvalidArgumentError(`takes 90s, 30m, 6h or a number of seconds, got "${value}"`);

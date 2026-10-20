@@ -9,7 +9,6 @@ migrate((app) => {
     fields: [
       { name: "resource", type: "text", required: true },
       { name: "holder", type: "text", required: true },
-
       { name: "host", type: "text" },
       { name: "why", type: "text" },
       { name: "queued_at", type: "number", required: true },

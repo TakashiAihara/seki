@@ -34,7 +34,6 @@ function text(v, required) {
 
 function validAcquire(b) {
   return text(b.resource, true) && text(b.holder, true) && text(b.host, false) && text(b.why, false) &&
-
     (b.renew === undefined || typeof b.renew === "boolean") &&
     (b.not_after === undefined || Number.isInteger(b.not_after)) &&
     (b.queue_ttl_sec === undefined || (Number.isInteger(b.queue_ttl_sec) && b.queue_ttl_sec >= 1 && b.queue_ttl_sec <= MAX_QUEUE_TTL_SEC)) &&

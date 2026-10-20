@@ -18,14 +18,12 @@ seki ls [--json]
 seki run <resource> [--ttl <duration>] [--why <text>] [--wait <duration>] [--holder <id>] -- <command> [args...]
 ```
 
-
 - `--ttl` takes `90s`, `30m`, `6h` or a number of seconds, from 3 seconds up to 7 days (`168h`). The default is `10m`: a holder that crashes without releasing blocks others until then.
 - To renew, `acquire` again with the same holder. It replaces the caller's own lease (ttl and reason).
 - `--wait <duration>` (same format, up to 7 days) waits for a held resource instead of giving up at once. The caller joins the resource's queue, asks again every second, prints its place in the queue to stderr when it changes, and takes the lease when its turn comes. Past the duration it leaves the queue and exits as if it had not waited (1, or 124 for `run`).
 - The queue is first come, first served. A request waits behind every waiter that came before it, and a request without `--wait` comes after everyone waiting. The holder renewing its own lease is never held up by the queue.
 - While waiting, once the server has answered, an unreachable server or a gateway error (502 / 504) is asked again until the wait runs out; any other error, an unreachable server on the first request, or a wait that runs out while the server is unreachable ends with exit 2 (125 for `run`). A server that is down longer than the waiter's 40 seconds forgets the queue, and whoever asks first after it comes back goes first.
 - A waiter that stops asking (killed, or a Ctrl-C while waiting) drops out of the queue about 40 seconds later (2 × `SEKI_TIMEOUT_MS` + 21 s).
-
 - `ls` prints the live leases, then (when anyone waits) the queue: resource, place, holder, host, how long it has waited, why. `ls --json` prints `{"leases": [...], "waiting": [...]}`.
 - `release` drops only the caller's own lease. Releasing something you do not hold prints `not held <resource>` and exits 0.
 - `run` takes the lease, runs the command, renews the lease in the background every third of the TTL, and releases it when the command ends, however it ends. If the lease cannot be taken the command is not started.
@@ -84,6 +82,7 @@ SEKI_TOKEN=<shared token> bin/pocketbase serve --dir /var/lib/seki --hooksDir pb
 - A server started without `SEKI_TOKEN` refuses every request.
 - Trust model: anyone with the token can take, extend and release any lease. The holder is a name the client sends, not an identity the server checks; it keeps honest callers apart, not hostile ones.
 - The server speaks plain HTTP. Put it behind TLS if the token should not cross the network in the clear.
+- Upgrading from shared / exclusive leases (before the queue): update the server first, then the CLIs. A new CLI sends no `mode`, which an old server refuses (exit 2); an old CLI works against a new server, its `mode` is ignored and every lease is exclusive (its `ls` shows `undefined` where the mode was). Shared co-holders left from before keep their leases and can renew them, and keep everyone else out until the last of them lets go. Rolling the migration back marks every lease exclusive.
 - The server applies the migrations in `pb_migrations/` on start, so updating the checkout and restarting can change the schema.
 - The PocketBase admin UI (`/_/`) shows the `leases` collection and is the dashboard. Superuser login alerts ("login from a new location" mail) are turned off by a migration, and `deploy/seki.service` hides `sendmail` from the server, so the mail that password reset and the other mail routes would send fails at once. The HTTP routes still answer as usual (password reset returns 204); only the delivery fails, and no mail leaves the host. The server is not set up to send mail; before this, each attempt left a `sendmail` process retrying. Create the first superuser as the service's user, so the data files stay owned by it: `runuser -u seki -- bin/pocketbase superuser upsert <email> <password> --dir /var/lib/seki`.
 - `deploy/seki.service` runs the server as the system user `seki` with the data in `/var/lib/seki`; `deploy/update.sh` brings `/opt/seki` to `origin/main` and restarts it.
