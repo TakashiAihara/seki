@@ -8,17 +8,15 @@ declare const SEKI_VERSION: string;
 
 const version = typeof SEKI_VERSION === "undefined" ? "dev" : SEKI_VERSION;
 
-type Mode = "shared" | "exclusive";
+type Lease = { resource: string; holder: string; host: string; why: string; expires_at: number };
 
-type Lease = { resource: string; holder: string; mode: Mode; host: string; why: string; expires_at: number };
-
-type Waiter = { resource: string; holder: string; mode: Mode; host: string; why: string; queued_at: number; expires_at: number; position: number };
+type Waiter = { resource: string; holder: string; host: string; why: string; queued_at: number; expires_at: number; position: number };
 
 type FileConfig = { url?: string; token?: string; token_command?: string };
 
 type Config = { url: string; token: string };
 
-type LeaseOpts = { shared?: boolean; exclusive?: boolean; ttl: number; why?: string; holder?: string; wait?: number };
+type LeaseOpts = { ttl: number; why?: string; holder?: string; wait?: number };
 
 type Reply = { status: number; text: string };
 
@@ -83,7 +81,7 @@ async function connect(file: FileConfig): Promise<Config> {
 }
 
 // There is no default holder for acquire / release: every session of the
-// same user on one host would share it, and the second exclusive acquire would
+// same user on one host would share it, and the second acquire would
 // renew the first one's lease instead of being refused.
 function resolveHolder(flag: string | undefined): string {
   const holder = flag || process.env.SEKI_HOLDER;
@@ -101,11 +99,6 @@ function runHolder(flag: string | undefined): string {
 const MAX_TTL_SEC = 7 * 24 * 3600;
 const MIN_TTL_SEC = 3;
 
-function modeOf(o: LeaseOpts): Mode {
-  if (o.shared) return "shared";
-  if (o.exclusive) return "exclusive";
-  throw new Failure(2, "one of --shared or --exclusive is required");
-}
 
 function parseDuration(value: string): number {
   const m = /^([1-9]\d*)([smh]?)$/.exec(value);
@@ -162,7 +155,7 @@ function expectStatus<T>(r: Reply, status: number): T {
   return parseReply<T>(r);
 }
 
-type AcquireBody = { resource: string; holder: string; mode: Mode; ttl_sec: number; host: string; why?: string; renew?: boolean; queue_ttl_sec?: number };
+type AcquireBody = { resource: string; holder: string; ttl_sec: number; host: string; why?: string; renew?: boolean; queue_ttl_sec?: number };
 
 type AcquireResult = { lease: Lease; renewed: boolean } | { heldBy: Lease[]; waiting: Waiter[]; position?: number } | { gone: true };
 
@@ -274,11 +267,11 @@ async function listLeases(cfg: Config): Promise<{ leases: Lease[]; waiting: Wait
 function heldMessage(resource: string, heldBy: Lease[], waiting: Waiter[] = []): string {
   const held = heldBy.map(
     (l) =>
-      `  ${l.mode} by ${l.holder} on ${l.host} until ${new Date(l.expires_at).toISOString()}${l.why ? ` (${l.why})` : ""}`,
+      `  ${l.holder} on ${l.host} until ${new Date(l.expires_at).toISOString()}${l.why ? ` (${l.why})` : ""}`,
   );
   const queued = waiting.map(
     (w) =>
-      `  ${w.position}. ${w.mode} by ${w.holder} on ${w.host} since ${new Date(w.queued_at).toISOString()}${w.why ? ` (${w.why})` : ""}`,
+      `  ${w.position}. ${w.holder} on ${w.host} since ${new Date(w.queued_at).toISOString()}${w.why ? ` (${w.why})` : ""}`,
   );
   return [
     ...(held.length > 0 ? [`${resource} is held:`, ...held] : []),
@@ -298,25 +291,24 @@ function formatTable(leases: Lease[], waiting: Waiter[]): string {
   const now = Date.now();
   const minutes = (ms: number) => `${Math.max(0, Math.floor(ms / 60000))}m`;
   const held = table([
-    ["RESOURCE", "MODE", "HOLDER", "HOST", "EXPIRES", "WHY"],
-    ...leases.map((l) => [l.resource, l.mode, l.holder, l.host, `in ${minutes(l.expires_at - now)}`, l.why]),
+    ["RESOURCE", "HOLDER", "HOST", "EXPIRES", "WHY"],
+    ...leases.map((l) => [l.resource, l.holder, l.host, `in ${minutes(l.expires_at - now)}`, l.why]),
   ]);
   if (waiting.length === 0) return held;
   const queued = table([
-    ["RESOURCE", "POS", "MODE", "HOLDER", "HOST", "WAITING", "WHY"],
-    ...waiting.map((w) => [w.resource, String(w.position), w.mode, w.holder, w.host, `for ${minutes(now - w.queued_at)}`, w.why]),
+    ["RESOURCE", "POS", "HOLDER", "HOST", "WAITING", "WHY"],
+    ...waiting.map((w) => [w.resource, String(w.position), w.holder, w.host, `for ${minutes(now - w.queued_at)}`, w.why]),
   ]);
   return `${held}\n\n${queued}`;
 }
 
 async function acquireCmd(resource: string, o: LeaseOpts): Promise<number> {
-  const mode = modeOf(o);
   const holder = resolveHolder(o.holder);
   const cfg = await connect(await loadFileConfig());
-  const { result: r } = await acquireWaiting(cfg, { resource, holder, mode, ttl_sec: o.ttl, host: hostname(), why: o.why }, (o.wait ?? 0) * 1000);
+  const { result: r } = await acquireWaiting(cfg, { resource, holder, ttl_sec: o.ttl, host: hostname(), why: o.why }, (o.wait ?? 0) * 1000);
   if ("heldBy" in r) throw new Failure(1, heldMessage(resource, r.heldBy, r.waiting));
   if (!("lease" in r)) throw new Failure(2, "unexpected answer from the server");
-  console.log(`acquired ${resource} ${mode} until ${new Date(r.lease.expires_at).toISOString()}`);
+  console.log(`acquired ${resource} until ${new Date(r.lease.expires_at).toISOString()}`);
   return 0;
 }
 
@@ -345,11 +337,10 @@ const RUN_NOT_FOUND = 127;
 
 
 async function runCmd(resource: string, command: string[], o: LeaseOpts): Promise<number> {
-  const mode = modeOf(o);
   const killAfterMs = envMs("SEKI_KILL_AFTER_MS", 10_000, 0);
   const holder = runHolder(o.holder);
   const cfg = await connect(await loadFileConfig());
-  const body: AcquireBody = { resource, holder, mode, ttl_sec: o.ttl, host: hostname(), why: o.why };
+  const body: AcquireBody = { resource, holder, ttl_sec: o.ttl, host: hostname(), why: o.why };
 
   // performance.now() is monotonic: a wall-clock step cannot stretch the lease.
   let first: AcquireResult;
@@ -514,8 +505,6 @@ function addHolder(c: Command): Command {
 
 function addLeaseOptions(c: Command): Command {
   return addHolder(c)
-    .addOption(new Option("--shared", "several shared holders may coexist").conflicts("exclusive"))
-    .addOption(new Option("--exclusive", "no other holder while this one is held").conflicts("shared"))
     .addOption(
       new Option("--ttl <duration>", "90s, 30m, 6h or a number of seconds").argParser(parseTtl).default(600, "10m"),
     )
@@ -532,7 +521,7 @@ async function main(argv: string[]): Promise<number> {
 
   const program = new Command()
     .name("seki")
-    .description("shared / exclusive leases with TTL for resources that several agents or hosts contend for")
+    .description("exclusive leases with TTL and a FIFO queue, for resources that several agents or hosts contend for")
     .version(version)
     .exitOverride();
 
@@ -563,7 +552,7 @@ async function main(argv: string[]): Promise<number> {
       inRun = true;
       const sep = separatorIndex(argv);
       if (sep < 0 || argv.slice(sep + 1).join("\0") !== command.join("\0")) {
-        throw new Failure(2, "put -- before the command: seki run <resource> --shared -- <command>");
+        throw new Failure(2, "put -- before the command: seki run <resource> -- <command>");
       }
       code = await runCmd(resource, command, o);
     });

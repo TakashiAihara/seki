@@ -1,7 +1,7 @@
 {
   "name": "seki",
   "private": true,
-  "description": "Shared / exclusive leases with TTL for resources that several agents or hosts contend for",
+  "description": "Exclusive leases with TTL and a FIFO queue for resources that several agents or hosts contend for",
   "type": "module",
   "scripts": {
     "test": "bun test",

@@ -18,7 +18,7 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
 
   const b = e.requestInfo().body
   if (!seki.validAcquire(b)) {
-    return e.json(400, { ok: false, error: "resource and holder (strings up to 500 chars), mode (shared|exclusive) and ttl_sec (integer, 1 to 604800) are required; host and why are optional strings up to 500 chars; queue_ttl_sec is an optional integer, 1 to 3600" })
+    return e.json(400, { ok: false, error: "resource and holder (strings up to 500 chars) and ttl_sec (integer, 1 to 604800) are required; host and why are optional strings up to 500 chars; queue_ttl_sec is an optional integer, 1 to 3600" })
   }
 
   let res
@@ -33,47 +33,35 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     tx.db().newQuery("DELETE FROM waiters WHERE expires_at < {:now}").bind({ now }).execute()
 
     const others = tx.findRecordsByFilter("leases", "resource = {:r} && holder != {:h}", "", 0, 0, { r: b.resource, h: b.holder })
-    const blocking = others.filter((o) => seki.conflicts(b.mode, o.get("mode")))
 
     // Expired rows were deleted above, so a row found here is a live lease being renewed.
     const mine = tx.findRecordsByFilter("leases", "resource = {:r} && holder = {:h}", "", 1, 0, { r: b.resource, h: b.holder })
     const renewed = mine.length > 0
 
-    // A holder is ahead of everyone waiting, also when it moves its shared lease to exclusive:
-    // exclusive waiters need it to let go anyway, so making it wait for them would leave both
-    // waiting, and shared ones let past it could keep it from ever going exclusive.
-    // Anyone else comes after the waiters ahead of it in queueOrder; a request that does not queue
-    // comes after all of them, so it cannot take the resource from under the queue the moment it
-    // frees up (it still goes in with shared waiters when it is shared too). A renew (renew: true)
+    // The holder renewing is ahead of everyone waiting. Anyone else waits behind the waiters
+    // queued before it; a request that does not queue waits behind all of them, so it cannot
+    // take the resource from under the queue the moment it frees up. A renew (renew: true)
     // never queues: a lapsed one gets 410 below.
-    const arrived = tx.findRecordsByFilter("waiters", "resource = {:r}", "queued_at,id", 0, 0, { r: b.resource })
-    const holders = others.map((o) => o.get("holder")).concat(renewed ? [b.holder] : [])
-    const queue = seki.queueOrder(arrived, holders)
+    const queue = tx.findRecordsByFilter("waiters", "resource = {:r}", "queued_at,id", 0, 0, { r: b.resource })
     const at = queue.findIndex((w) => w.get("holder") === b.holder)
     const ahead = renewed || b.renew === true ? [] : at < 0 ? queue : queue.slice(0, at)
-    const waitingFor = ahead.filter((w) => seki.blockedByWaiter(b.mode, w.get("mode")))
 
-    if (blocking.length > 0 || waitingFor.length > 0) {
-      // A holder skips the queue, yet is told who is listed before it, matching its position.
-      const listed = renewed ? (at >= 0 ? queue.slice(0, at) : queue.filter((q) => holders.indexOf(q.get("holder")) >= 0)) : ahead
-      const body = { ok: false, held_by: blocking.map(seki.lease), waiting: listed.map((w, i) => seki.waiter(w, i + 1)), queued: false }
+    if (others.length > 0 || ahead.length > 0) {
+      const body = { ok: false, held_by: others.map(seki.lease), waiting: ahead.map((w, i) => seki.waiter(w, i + 1)), queued: false }
       if (b.queue_ttl_sec !== undefined && b.renew !== true) {
         const w = at >= 0 ? queue[at] : new Record(tx.findCollectionByNameOrId("waiters"))
         if (at < 0) {
           w.set("resource", b.resource)
           w.set("holder", b.holder)
           // Strictly after the last waiter, so two arriving in the same millisecond keep their order.
-          w.set("queued_at", arrived.length > 0 ? Math.max(now, arrived[arrived.length - 1].get("queued_at") + 1) : now)
+          w.set("queued_at", queue.length > 0 ? Math.max(now, queue[queue.length - 1].get("queued_at") + 1) : now)
         }
-        w.set("mode", b.mode)
         w.set("host", b.host || "")
         w.set("why", b.why || "")
         w.set("expires_at", now + b.queue_ttl_sec * 1000)
         tx.save(w)
         body.queued = true
-        // A holder that just joined goes after the holders already waiting, before everyone else.
-        const newAt = renewed ? queue.filter((q) => holders.indexOf(q.get("holder")) >= 0).length : queue.length
-        body.position = (at >= 0 ? at : newAt) + 1
+        body.position = (at < 0 ? queue.length : at) + 1
       }
       res = { status: 409, body }
       return
@@ -86,13 +74,12 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     const rec = renewed ? mine[0] : new Record(tx.findCollectionByNameOrId("leases"))
     rec.set("resource", b.resource)
     rec.set("holder", b.holder)
-    rec.set("mode", b.mode)
+
     rec.set("host", b.host || "")
     rec.set("why", b.why || "")
     rec.set("expires_at", now + b.ttl_sec * 1000)
     tx.save(rec)
-    // A holder renewing its shared lease while it waits to go exclusive stays in the queue.
-    if (at >= 0 && !(renewed && queue[at].get("mode") !== b.mode)) tx.delete(queue[at])
+    if (at >= 0) tx.delete(queue[at])
     res = { status: 200, body: { ok: true, renewed, lease: seki.lease(rec) } }
   })
   return e.json(res.status, res.body)
@@ -111,8 +98,7 @@ routerAdd("POST", "/api/seki/release", (e) => {
   return e.json(200, { ok: true, released: r.rowsAffected() })
 })
 
-// Leaves the queue without touching a lease the caller may hold (one waiting to move a
-// shared lease to exclusive keeps the shared one when it gives up).
+// Leaves the queue. Kept apart from release so that giving up a wait never drops a lease.
 routerAdd("POST", "/api/seki/unqueue", (e) => {
   const seki = require(`${__hooks}/seki_lib.js`)
   const denied = seki.authorize(e)
@@ -133,19 +119,11 @@ routerAdd("GET", "/api/seki/leases", (e) => {
 
   const now = Date.now()
   const rows = $app.findRecordsByFilter("leases", "expires_at >= {:now}", "resource,holder", 0, 0, { now })
-  const holders = {}
-  rows.forEach((l) => (holders[l.get("resource")] = holders[l.get("resource")] || []).push(l.get("holder")))
-  const byResource = {}
-  const resources = []
-  $app.findRecordsByFilter("waiters", "expires_at >= {:now}", "resource,queued_at,id", 0, 0, { now }).forEach((w) => {
-    const r = w.get("resource")
-    if (!byResource[r]) {
-      byResource[r] = []
-      resources.push(r)
-    }
-    byResource[r].push(w)
+  const queued = $app.findRecordsByFilter("waiters", "expires_at >= {:now}", "resource,queued_at,id", 0, 0, { now })
+  let position = 0
+  const waiting = queued.map((w, i) => {
+    position = i > 0 && queued[i - 1].get("resource") === w.get("resource") ? position + 1 : 1
+    return seki.waiter(w, position)
   })
-  const waiting = []
-  resources.forEach((r) => seki.queueOrder(byResource[r], holders[r] || []).forEach((w, i) => waiting.push(seki.waiter(w, i + 1))))
   return e.json(200, { ok: true, leases: rows.map(seki.lease), waiting })
 })

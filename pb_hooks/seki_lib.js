@@ -16,32 +16,11 @@ function authorize(e) {
 }
 
 function lease(o) {
-  return { resource: o.get("resource"), holder: o.get("holder"), mode: o.get("mode"), host: o.get("host"), why: o.get("why"), expires_at: o.get("expires_at") }
+  return { resource: o.get("resource"), holder: o.get("holder"), host: o.get("host"), why: o.get("why"), expires_at: o.get("expires_at") }
 }
 
 function waiter(o, position) {
-  return { resource: o.get("resource"), holder: o.get("holder"), mode: o.get("mode"), host: o.get("host"), why: o.get("why"), queued_at: o.get("queued_at"), expires_at: o.get("expires_at"), position }
-}
-
-function conflicts(a, b) {
-  return a === "exclusive" || b === "exclusive"
-}
-
-// Whether a waiter ahead in the queue keeps this request out. The same rule as for
-// leases, so a shared request cannot pass an exclusive waiter: a stream of shared
-// holders would otherwise keep the exclusive one waiting forever.
-function blockedByWaiter(mode, aheadMode) {
-  return conflicts(mode, aheadMode)
-}
-
-// The order a resource's queue is served in. A waiter that already holds a lease on it (one
-// moving shared to exclusive) goes first (see acquire for why); the rest
-// keep arrival order. acquire and the list both use this, so the place a caller is told is the
-// place ls shows. For waiters that hold nothing it is also the order they are served in; holders
-// are served as soon as the other leases are gone, whatever their place among themselves.
-function queueOrder(waiters, holders) {
-  const holds = (w) => holders.indexOf(w.get("holder")) >= 0
-  return waiters.filter(holds).concat(waiters.filter((w) => !holds(w)))
+  return { resource: o.get("resource"), holder: o.get("holder"), host: o.get("host"), why: o.get("why"), queued_at: o.get("queued_at"), expires_at: o.get("expires_at"), position }
 }
 
 const MAX_TTL_SEC = 7 * 24 * 3600
@@ -55,11 +34,11 @@ function text(v, required) {
 
 function validAcquire(b) {
   return text(b.resource, true) && text(b.holder, true) && text(b.host, false) && text(b.why, false) &&
-    (b.mode === "shared" || b.mode === "exclusive") &&
+
     (b.renew === undefined || typeof b.renew === "boolean") &&
     (b.not_after === undefined || Number.isInteger(b.not_after)) &&
     (b.queue_ttl_sec === undefined || (Number.isInteger(b.queue_ttl_sec) && b.queue_ttl_sec >= 1 && b.queue_ttl_sec <= MAX_QUEUE_TTL_SEC)) &&
     Number.isInteger(b.ttl_sec) && b.ttl_sec >= 1 && b.ttl_sec <= MAX_TTL_SEC
 }
 
-module.exports = { authorize, lease, waiter, conflicts, blockedByWaiter, queueOrder, validAcquire }
+module.exports = { authorize, lease, waiter, validAcquire }
