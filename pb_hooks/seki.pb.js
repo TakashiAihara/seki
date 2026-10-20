@@ -41,11 +41,13 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
 
     // A holder is ahead of everyone waiting, also when it moves its shared lease to exclusive:
     // the waiters need it to let go anyway, so making it wait for them would leave both waiting.
-    // Anyone else comes after the waiters queued before it; a request that does not queue comes
-    // after all of them, so it cannot take the resource from under the queue the moment it frees
-    // up (it still goes in with shared waiters when it is shared too). A renew (renew: true)
+    // Anyone else comes after the waiters ahead of it in queueOrder; a request that does not queue
+    // comes after all of them, so it cannot take the resource from under the queue the moment it
+    // frees up (it still goes in with shared waiters when it is shared too). A renew (renew: true)
     // never queues: a lapsed one gets 410 below.
-    const queue = tx.findRecordsByFilter("waiters", "resource = {:r}", "queued_at,id", 0, 0, { r: b.resource })
+    const arrived = tx.findRecordsByFilter("waiters", "resource = {:r}", "queued_at,id", 0, 0, { r: b.resource })
+    const holders = others.map((o) => o.get("holder")).concat(renewed ? [b.holder] : [])
+    const queue = seki.queueOrder(arrived, holders)
     const at = queue.findIndex((w) => w.get("holder") === b.holder)
     const ahead = renewed || b.renew === true ? [] : at < 0 ? queue : queue.slice(0, at)
     const waitingFor = ahead.filter((w) => seki.blockedByWaiter(b.mode, w.get("mode")))
@@ -58,7 +60,7 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
           w.set("resource", b.resource)
           w.set("holder", b.holder)
           // Strictly after the last waiter, so two arriving in the same millisecond keep their order.
-          w.set("queued_at", queue.length > 0 ? Math.max(now, queue[queue.length - 1].get("queued_at") + 1) : now)
+          w.set("queued_at", arrived.length > 0 ? Math.max(now, arrived[arrived.length - 1].get("queued_at") + 1) : now)
         }
         w.set("mode", b.mode)
         w.set("host", b.host || "")
@@ -66,8 +68,9 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
         w.set("expires_at", now + b.queue_ttl_sec * 1000)
         tx.save(w)
         body.queued = true
-        // A holder goes ahead of the queue whatever its arrival time, so it is told it is first.
-        body.position = renewed ? 1 : (at < 0 ? queue.length : at) + 1
+        // A holder that just joined goes after the holders already waiting, before everyone else.
+        const newAt = renewed ? queue.filter((q) => holders.indexOf(q.get("holder")) >= 0).length : queue.length
+        body.position = (at >= 0 ? at : newAt) + 1
       }
       res = { status: 409, body }
       return
@@ -127,21 +130,19 @@ routerAdd("GET", "/api/seki/leases", (e) => {
 
   const now = Date.now()
   const rows = $app.findRecordsByFilter("leases", "expires_at >= {:now}", "resource,holder", 0, 0, { now })
-  // Waiters that hold a lease on the resource go ahead of the queue (see acquire), so they are
-  // listed first within their resource; the rest in arrival order.
-  const holds = new Set(rows.map((l) => l.get("resource") + "\n" + l.get("holder")))
-  const holding = (w) => holds.has(w.get("resource") + "\n" + w.get("holder"))
-  const found = $app.findRecordsByFilter("waiters", "expires_at >= {:now}", "resource,queued_at,id", 0, 0, { now })
-  const group = {}
-  found.forEach((w, i) => { if (!(w.get("resource") in group)) group[w.get("resource")] = i })
-  const key = (w, i) => [group[w.get("resource")], holding(w) ? 0 : 1, i]
-  const queued = found.map((w, i) => [w, key(w, i)])
-    .sort((a, b) => a[1][0] - b[1][0] || a[1][1] - b[1][1] || a[1][2] - b[1][2])
-    .map((p) => p[0])
-  let position = 0
-  const waiting = queued.map((w, i) => {
-    position = i > 0 && queued[i - 1].get("resource") === w.get("resource") ? position + 1 : 1
-    return seki.waiter(w, position)
+  const holders = {}
+  rows.forEach((l) => (holders[l.get("resource")] = holders[l.get("resource")] || []).push(l.get("holder")))
+  const byResource = {}
+  const resources = []
+  $app.findRecordsByFilter("waiters", "expires_at >= {:now}", "resource,queued_at,id", 0, 0, { now }).forEach((w) => {
+    const r = w.get("resource")
+    if (!byResource[r]) {
+      byResource[r] = []
+      resources.push(r)
+    }
+    byResource[r].push(w)
   })
+  const waiting = []
+  resources.forEach((r) => seki.queueOrder(byResource[r], holders[r] || []).forEach((w, i) => waiting.push(seki.waiter(w, i + 1))))
   return e.json(200, { ok: true, leases: rows.map(seki.lease), waiting })
 })

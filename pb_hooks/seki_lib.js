@@ -34,6 +34,15 @@ function blockedByWaiter(mode, aheadMode) {
   return conflicts(mode, aheadMode)
 }
 
+// The order a resource's queue is served in. A waiter that already holds a lease on it (one
+// moving shared to exclusive) goes first, since the others need it to let go anyway; the rest
+// keep arrival order. acquire and the list both use this, so the place a caller is told is
+// the place it is served in.
+function queueOrder(waiters, holders) {
+  const holds = (w) => holders.indexOf(w.get("holder")) >= 0
+  return waiters.filter(holds).concat(waiters.filter((w) => !holds(w)))
+}
+
 const MAX_TTL_SEC = 7 * 24 * 3600
 const MAX_QUEUE_TTL_SEC = 3600
 const MAX_TEXT = 500
@@ -52,4 +61,4 @@ function validAcquire(b) {
     Number.isInteger(b.ttl_sec) && b.ttl_sec >= 1 && b.ttl_sec <= MAX_TTL_SEC
 }
 
-module.exports = { authorize, lease, waiter, conflicts, blockedByWaiter, validAcquire }
+module.exports = { authorize, lease, waiter, conflicts, blockedByWaiter, queueOrder, validAcquire }

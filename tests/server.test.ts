@@ -210,14 +210,39 @@ describe("queue", () => {
     expect((await wait("q14", "x", "exclusive")).status).toBe(200);
   });
 
-  test("a holder's wait does not hold up a shared waiter that came before it", async () => {
+  test("a holder waiting to go exclusive is served before a shared waiter that came earlier", async () => {
     await acquire("q15", "a", "shared");
     await acquire("q15", "b", "shared");
     await wait("q15", "x", "exclusive");
     await wait("q15", "s", "shared");
     await wait("q15", "a", "exclusive");
     await post("unqueue", { resource: "q15", holder: "x" });
-    expect((await wait("q15", "s", "shared")).status).toBe(200);
+    const s2 = await refusal(await wait("q15", "s", "shared"));
+    expect(s2.waiting.map((w) => [w.holder, w.position])).toEqual([["a", 1]]);
+    expect(s2.position).toBe(2);
+  });
+
+  test("the place acquire tells each waiter is the place ls shows, with holders first", async () => {
+    await acquire("q16", "a", "shared");
+    await acquire("q16", "b", "shared");
+    await wait("q16", "x", "exclusive");
+    expect((await refusal(await wait("q16", "a", "exclusive"))).position).toBe(1);
+    expect((await refusal(await wait("q16", "b", "exclusive"))).position).toBe(2);
+    const x = await refusal(await wait("q16", "x", "exclusive"));
+    expect(x.position).toBe(3);
+    expect(x.waiting.map((w) => w.holder)).toEqual(["a", "b"]);
+    expect((await waiting()).filter((w) => w.resource === "q16").map((w) => [w.holder, w.position])).toEqual([["a", 1], ["b", 2], ["x", 3]]);
+  });
+
+  test("ls numbers each resource's queue on its own, holders first in each", async () => {
+    for (const r of ["q17a", "q17b"]) {
+      await acquire(r, "h", "shared");
+      await acquire(r, "o", "shared");
+      await wait(r, "p", "exclusive");
+      await wait(r, "h", "exclusive");
+    }
+    const got = (await waiting()).filter((w) => w.resource.startsWith("q17")).map((w) => [w.resource, w.holder, w.position]);
+    expect(got).toEqual([["q17a", "h", 1], ["q17a", "p", 2], ["q17b", "h", 1], ["q17b", "p", 2]]);
   });
 
   test("a waiter that takes the resource in another mode than it queued with leaves the queue", async () => {
