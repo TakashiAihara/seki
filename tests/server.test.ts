@@ -199,6 +199,27 @@ describe("queue", () => {
     expect((await waiting()).filter((w) => w.resource === "q12").map((w) => [w.holder, w.position])).toEqual([["a", 1], ["x", 2]]);
   });
 
+  test("a holder whose lease lapses while it waits keeps its arrival place, behind earlier waiters", async () => {
+    await acquire("q14", "a", "shared", 1);
+    await acquire("q14", "b", "shared");
+    await wait("q14", "x", "exclusive");
+    await wait("q14", "a", "exclusive");
+    await Bun.sleep(1500);
+    await post("release", { resource: "q14", holder: "b" });
+    expect((await wait("q14", "a", "exclusive")).status).toBe(409);
+    expect((await wait("q14", "x", "exclusive")).status).toBe(200);
+  });
+
+  test("a holder's wait does not hold up a shared waiter that came before it", async () => {
+    await acquire("q15", "a", "shared");
+    await acquire("q15", "b", "shared");
+    await wait("q15", "x", "exclusive");
+    await wait("q15", "s", "shared");
+    await wait("q15", "a", "exclusive");
+    await post("unqueue", { resource: "q15", holder: "x" });
+    expect((await wait("q15", "s", "shared")).status).toBe(200);
+  });
+
   test("a waiter that takes the resource in another mode than it queued with leaves the queue", async () => {
     await acquire("q13", "a", "exclusive");
     await wait("q13", "c", "exclusive");

@@ -58,10 +58,7 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
           w.set("resource", b.resource)
           w.set("holder", b.holder)
           // Strictly after the last waiter, so two arriving in the same millisecond keep their order.
-          // A holder goes ahead of the queue, so its place is shown at the front.
-          const last = queue.length > 0 ? queue[queue.length - 1].get("queued_at") : now - 1
-          const first = queue.length > 0 ? queue[0].get("queued_at") : now + 1
-          w.set("queued_at", renewed ? Math.min(now, first - 1) : Math.max(now, last + 1))
+          w.set("queued_at", queue.length > 0 ? Math.max(now, queue[queue.length - 1].get("queued_at") + 1) : now)
         }
         w.set("mode", b.mode)
         w.set("host", b.host || "")
@@ -69,7 +66,8 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
         w.set("expires_at", now + b.queue_ttl_sec * 1000)
         tx.save(w)
         body.queued = true
-        body.position = at >= 0 ? at + 1 : renewed ? 1 : queue.length + 1
+        // A holder goes ahead of the queue whatever its arrival time, so it is told it is first.
+        body.position = renewed ? 1 : (at < 0 ? queue.length : at) + 1
       }
       res = { status: 409, body }
       return
@@ -129,7 +127,17 @@ routerAdd("GET", "/api/seki/leases", (e) => {
 
   const now = Date.now()
   const rows = $app.findRecordsByFilter("leases", "expires_at >= {:now}", "resource,holder", 0, 0, { now })
-  const queued = $app.findRecordsByFilter("waiters", "expires_at >= {:now}", "resource,queued_at,id", 0, 0, { now })
+  // Waiters that hold a lease on the resource go ahead of the queue (see acquire), so they are
+  // listed first within their resource; the rest in arrival order.
+  const holds = new Set(rows.map((l) => l.get("resource") + "\n" + l.get("holder")))
+  const holding = (w) => holds.has(w.get("resource") + "\n" + w.get("holder"))
+  const found = $app.findRecordsByFilter("waiters", "expires_at >= {:now}", "resource,queued_at,id", 0, 0, { now })
+  const group = {}
+  found.forEach((w, i) => { if (!(w.get("resource") in group)) group[w.get("resource")] = i })
+  const key = (w, i) => [group[w.get("resource")], holding(w) ? 0 : 1, i]
+  const queued = found.map((w, i) => [w, key(w, i)])
+    .sort((a, b) => a[1][0] - b[1][0] || a[1][1] - b[1][1] || a[1][2] - b[1][2])
+    .map((p) => p[0])
   let position = 0
   const waiting = queued.map((w, i) => {
     position = i > 0 && queued[i - 1].get("resource") === w.get("resource") ? position + 1 : 1
