@@ -16,10 +16,15 @@ function authorize(e) {
 }
 
 function lease(o) {
-  return { resource: o.get("resource"), holder: o.get("holder"), mode: o.get("mode"), host: o.get("host"), why: o.get("why"), expires_at: o.get("expires_at") }
+  return { resource: o.get("resource"), holder: o.get("holder"), host: o.get("host"), why: o.get("why"), expires_at: o.get("expires_at") }
+}
+
+function waiter(o, position) {
+  return { resource: o.get("resource"), holder: o.get("holder"), host: o.get("host"), why: o.get("why"), queued_at: o.get("queued_at"), expires_at: o.get("expires_at"), position }
 }
 
 const MAX_TTL_SEC = 7 * 24 * 3600
+const MAX_QUEUE_TTL_SEC = 3600
 const MAX_TEXT = 500
 
 function text(v, required) {
@@ -29,10 +34,10 @@ function text(v, required) {
 
 function validAcquire(b) {
   return text(b.resource, true) && text(b.holder, true) && text(b.host, false) && text(b.why, false) &&
-    (b.mode === "shared" || b.mode === "exclusive") &&
     (b.renew === undefined || typeof b.renew === "boolean") &&
     (b.not_after === undefined || Number.isInteger(b.not_after)) &&
+    (b.queue_ttl_sec === undefined || (Number.isInteger(b.queue_ttl_sec) && b.queue_ttl_sec >= 1 && b.queue_ttl_sec <= MAX_QUEUE_TTL_SEC)) &&
     Number.isInteger(b.ttl_sec) && b.ttl_sec >= 1 && b.ttl_sec <= MAX_TTL_SEC
 }
 
-module.exports = { authorize, lease, validAcquire }
+module.exports = { authorize, lease, waiter, validAcquire }
