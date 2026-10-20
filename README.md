@@ -12,15 +12,19 @@ The server is [PocketBase](https://pocketbase.io) with the hooks and migration i
 ## CLI
 
 ```text
-seki acquire <resource> (--shared | --exclusive) [--ttl <duration>] [--why <text>] (--holder <id> | $SEKI_HOLDER)
+seki acquire <resource> (--shared | --exclusive) [--ttl <duration>] [--why <text>] [--wait <duration>] (--holder <id> | $SEKI_HOLDER)
 seki release <resource> (--holder <id> | $SEKI_HOLDER)
 seki ls [--json]
-seki run <resource> (--shared | --exclusive) [--ttl <duration>] [--why <text>] [--holder <id>] -- <command> [args...]
+seki run <resource> (--shared | --exclusive) [--ttl <duration>] [--why <text>] [--wait <duration>] [--holder <id>] -- <command> [args...]
 ```
 
 - `--shared` or `--exclusive` is required. There is no default mode.
 - `--ttl` takes `90s`, `30m`, `6h` or a number of seconds, from 3 seconds up to 7 days (`168h`). The default is `10m`: a holder that crashes without releasing blocks others until then.
 - To renew, `acquire` again with the same holder. It replaces the caller's own lease (mode, ttl and reason), so it can also move a shared lease to exclusive when nobody else holds the resource.
+- `--wait <duration>` (same format, up to 7 days) waits for a held resource instead of giving up at once. The caller joins the resource's queue, asks again every second, prints its place in the queue to stderr when it changes, and takes the lease when its turn comes. Past the duration it leaves the queue and exits as if it had not waited (1, or 124 for `run`).
+- The queue is first come, first served. A request waits behind every waiter that came before it and would conflict with it (either side exclusive), so a shared request does not pass an exclusive one that is waiting, even while only shared holders hold the resource. Shared waiters with no exclusive one ahead go in together. A request without `--wait` comes after everyone waiting. A holder renewing its own lease is never held up by the queue.
+- A waiter that stops asking (killed, or a Ctrl-C while waiting) drops out of the queue about 30 seconds later (`SEKI_TIMEOUT_MS` + 21 s).
+- `ls` prints the live leases, then (when anyone waits) the queue: resource, place, mode, holder, host, how long it has waited, why. `ls --json` prints `{"leases": [...], "waiting": [...]}`.
 - `release` drops only the caller's own lease. Releasing something you do not hold prints `not held <resource>` and exits 0.
 - `run` takes the lease, runs the command, renews the lease in the background every third of the TTL, and releases it when the command ends, however it ends. If the lease cannot be taken the command is not started.
 - `run` stops the command when it loses the lease while the command runs: the lease lapsed before a renew got through (each renew is cut off at the lease's expiry, so a hung server cannot stretch it), the server no longer had the lease when a renew arrived, or another holder holds it now. Whoever holds the lease now was told the resource is theirs. The command's whole process group gets SIGTERM, and SIGKILL `SEKI_KILL_AFTER_MS` later (default 10000) if any of it is still running. Until then the command can overlap the next holder by up to that long.
@@ -40,7 +44,7 @@ seki run <resource> (--shared | --exclusive) [--ttl <duration>] [--why <text>] [
 | code | meaning |
 | --- | --- |
 | 0 | done (`run`: the command's own exit code) |
-| 1 | the resource is held by someone else; stderr lists who, in which mode, from which host, why, and until when |
+| 1 | the resource is held by someone else, or others are waiting for it first; stderr lists who holds it (mode, host, reason, until when) and who waits ahead |
 | 2 | usage error, missing configuration, server unreachable, wrong token, or any other server error |
 
 `run` passes the command's exit code through (128 + the signal number when the command is killed by a signal), so its own outcomes use codes of their own:

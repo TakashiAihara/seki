@@ -66,7 +66,7 @@ type Lease = { resource: string; holder: string; mode: string; host: string; why
 async function ls(): Promise<Lease[]> {
   const r = await seki(["ls", "--json"]);
   expect(r.code).toBe(0);
-  return JSON.parse(r.out) as Lease[];
+  return (JSON.parse(r.out) as { leases: Lease[] }).leases;
 }
 
 describe("acquire", () => {
@@ -613,6 +613,97 @@ describe("run", () => {
     const r = await seki(["run", "x5", "--shared", "--", "sh", "-c", "kill -TERM $$"]);
     expect(r.code).toBe(143);
     expect((await ls()).some((x) => x.resource === "x5")).toBe(false);
+  });
+});
+
+describe("--wait", () => {
+  type Waiter = { resource: string; holder: string; position: number };
+  async function waitingFor(resource: string): Promise<Waiter[]> {
+    const r = await seki(["ls", "--json"]);
+    return (JSON.parse(r.out) as { waiting: Waiter[] }).waiting.filter((w) => w.resource === resource);
+  }
+  async function untilQueued(resource: string, n: number) {
+    for (let i = 0; i < 100 && (await waitingFor(resource)).length < n; i++) await Bun.sleep(100);
+    expect(await waitingFor(resource)).toHaveLength(n);
+  }
+
+  test("acquire --wait queues, says its place, and takes the lease once it is released", async () => {
+    await seki(["acquire", "w1", "--exclusive"], { SEKI_HOLDER: "owner" });
+    const waiting = seki(["acquire", "w1", "--exclusive", "--wait", "30s"], { SEKI_HOLDER: "next" });
+    await untilQueued("w1", 1);
+    expect((await waitingFor("w1"))[0]).toMatchObject({ holder: "next", position: 1 });
+    await seki(["release", "w1"], { SEKI_HOLDER: "owner" });
+    const r = await waiting;
+    expect(r.code).toBe(0);
+    expect(r.err).toContain("number 1 in the queue");
+    expect((await ls()).find((x) => x.resource === "w1")?.holder).toBe("next");
+    expect(await waitingFor("w1")).toEqual([]);
+  });
+
+  test("acquire --wait gives up after the duration with exit 1 and leaves the queue", async () => {
+    await seki(["acquire", "w2", "--exclusive"], { SEKI_HOLDER: "owner" });
+    const started = performance.now();
+    const r = await seki(["acquire", "w2", "--exclusive", "--wait", "3s"], { SEKI_HOLDER: "next" });
+    expect(r.code).toBe(1);
+    expect(performance.now() - started).toBeGreaterThan(1500);
+    expect(r.err).toContain("owner");
+    expect(await waitingFor("w2")).toEqual([]);
+  });
+
+  test("giving up on moving a shared lease to exclusive keeps the shared lease", async () => {
+    await seki(["acquire", "w3", "--shared"], { SEKI_HOLDER: "a" });
+    await seki(["acquire", "w3", "--shared"], { SEKI_HOLDER: "b" });
+    expect((await seki(["acquire", "w3", "--exclusive", "--wait", "2s"], { SEKI_HOLDER: "a" })).code).toBe(1);
+    expect((await ls()).find((x) => x.resource === "w3" && x.holder === "a")?.mode).toBe("shared");
+  });
+
+  test("a request without --wait does not jump the queue", async () => {
+    await seki(["acquire", "w4", "--exclusive"], { SEKI_HOLDER: "owner" });
+    const waiting = seki(["acquire", "w4", "--exclusive", "--wait", "30s"], { SEKI_HOLDER: "next" });
+    await untilQueued("w4", 1);
+    await seki(["release", "w4"], { SEKI_HOLDER: "owner" });
+    const cut = await seki(["acquire", "w4", "--exclusive"], { SEKI_HOLDER: "cutter" });
+    expect(cut.code).toBe(1);
+    expect(cut.err).toContain("1. exclusive by next");
+    expect((await waiting).code).toBe(0);
+  });
+
+  test("runs waiting for one resource start in the order they queued", async () => {
+    await seki(["acquire", "w5", "--exclusive"], { SEKI_HOLDER: "owner" });
+    const log = join(tempDir("seki-wait-"), "order");
+    const first = seki(["run", "w5", "--exclusive", "--wait", "30s", "--", "sh", "-c", `echo first >> ${log}; sleep 1`], { SEKI_HOLDER: "one" });
+    await untilQueued("w5", 1);
+    const second = seki(["run", "w5", "--exclusive", "--wait", "30s", "--", "sh", "-c", `echo second >> ${log}`], { SEKI_HOLDER: "two" });
+    await untilQueued("w5", 2);
+    expect((await waitingFor("w5")).map((w) => w.position)).toEqual([1, 2]);
+    await seki(["release", "w5"], { SEKI_HOLDER: "owner" });
+    expect((await first).code).toBe(0);
+    expect((await second).code).toBe(0);
+    expect(await Bun.file(log).text()).toBe("first\nsecond\n");
+  });
+
+  test("run --wait that runs out exits 124 without starting the command", async () => {
+    await seki(["acquire", "w6", "--exclusive"], { SEKI_HOLDER: "owner" });
+    const marker = join(tempDir("seki-wait-"), "ran");
+    const r = await seki(["run", "w6", "--exclusive", "--wait", "2s", "--", "touch", marker], { SEKI_HOLDER: "next" });
+    expect(r.code).toBe(124);
+    expect(existsSync(marker)).toBe(false);
+    expect(await waitingFor("w6")).toEqual([]);
+  });
+
+  test("ls shows who waits for what, in which place", async () => {
+    await seki(["acquire", "w7", "--exclusive"], { SEKI_HOLDER: "owner" });
+    const waiting = seki(["acquire", "w7", "--shared", "--wait", "30s", "--why", "eval run"], { SEKI_HOLDER: "hana" });
+    await untilQueued("w7", 1);
+    const lines = (await seki(["ls"])).out.trim().split("\n");
+    expect(lines).toContainEqual(expect.stringMatching(/^RESOURCE\s+POS\s+MODE\s+HOLDER\s+HOST\s+WAITING\s+WHY$/));
+    expect(lines).toContainEqual(expect.stringMatching(/^w7\s+1\s+shared\s+hana\s+\S+\s+for \d+m\s+eval run$/));
+    await seki(["release", "w7"], { SEKI_HOLDER: "owner" });
+    expect((await waiting).code).toBe(0);
+  });
+
+  test.each(["0", "0s", "169h", "soon"])("--wait %s is a usage error", async (v) => {
+    expect((await seki(["acquire", "w8", "--shared", "--wait", v])).code).toBe(2);
   });
 });
 

@@ -114,6 +114,88 @@ describe("modes", () => {
   });
 });
 
+describe("queue", () => {
+  type Refusal = { held_by: { holder: string }[]; waiting: { holder: string; position: number }[]; queued: boolean; position?: number };
+  const wait = (resource: string, holder: string, mode: string, queue_ttl_sec = 60) =>
+    post("acquire", { resource, holder, mode, ttl_sec: 60, host: "h", why: `why-${holder}`, queue_ttl_sec });
+  const refusal = async (r: Response) => {
+    expect(r.status).toBe(409);
+    return (await r.json()) as Refusal;
+  };
+  const waiting = async () =>
+    ((await (await fetch(`${s.url}/api/seki/leases`, { headers: { authorization: `Bearer ${s.token}` } })).json()) as { waiting: { resource: string; holder: string; position: number }[] }).waiting;
+
+  test("waiters get the resource in the order they came, and a request that does not queue goes last", async () => {
+    await acquire("q1", "a", "exclusive");
+    expect(await refusal(await wait("q1", "b", "exclusive"))).toMatchObject({ queued: true, position: 1 });
+    expect(await refusal(await wait("q1", "c", "exclusive"))).toMatchObject({ queued: true, position: 2 });
+    const d = await refusal(await acquire("q1", "d", "exclusive"));
+    expect(d.queued).toBe(false);
+    expect(d.waiting.map((w) => [w.holder, w.position])).toEqual([["b", 1], ["c", 2]]);
+
+    await post("release", { resource: "q1", holder: "a" });
+    const c = await refusal(await wait("q1", "c", "exclusive"));
+    expect(c.held_by).toEqual([]);
+    expect(c.position).toBe(2);
+    expect((await acquire("q1", "d", "exclusive")).status).toBe(409);
+    expect((await wait("q1", "b", "exclusive")).status).toBe(200);
+    expect((await waiting()).filter((w) => w.resource === "q1").map((w) => [w.holder, w.position])).toEqual([["c", 1]]);
+
+    await post("release", { resource: "q1", holder: "b" });
+    expect((await wait("q1", "c", "exclusive")).status).toBe(200);
+  });
+
+  test("a shared request does not pass an exclusive waiter, even while only shared holders hold it", async () => {
+    await acquire("q2", "a", "shared");
+    await wait("q2", "x", "exclusive");
+    const s2 = await refusal(await acquire("q2", "s", "shared"));
+    expect(s2.held_by).toEqual([]);
+    expect(s2.waiting.map((w) => w.holder)).toEqual(["x"]);
+  });
+
+  test("shared waiters do not hold each other up", async () => {
+    await acquire("q3", "a", "exclusive");
+    await wait("q3", "s1", "shared");
+    await wait("q3", "s2", "shared");
+    await post("release", { resource: "q3", holder: "a" });
+    expect((await wait("q3", "s2", "shared")).status).toBe(200);
+    expect((await wait("q3", "s1", "shared")).status).toBe(200);
+  });
+
+  test("a holder renewing is not held up by the queue", async () => {
+    await acquire("q4", "a", "exclusive");
+    await wait("q4", "b", "exclusive");
+    expect((await post("acquire", { resource: "q4", holder: "a", mode: "exclusive", ttl_sec: 60, renew: true })).status).toBe(200);
+  });
+
+  test("a waiter that stops asking falls out of the queue after its queue_ttl_sec", async () => {
+    await acquire("q5", "a", "exclusive");
+    await wait("q5", "b", "exclusive", 1);
+    await post("release", { resource: "q5", holder: "a" });
+    expect((await acquire("q5", "c", "exclusive")).status).toBe(409);
+    await Bun.sleep(1500);
+    expect((await acquire("q5", "c", "exclusive")).status).toBe(200);
+  });
+
+  test("unqueue leaves the queue and keeps the caller's lease", async () => {
+    await acquire("q6", "a", "shared");
+    await acquire("q6", "b", "shared");
+    const up = await refusal(await wait("q6", "a", "exclusive"));
+    expect(up.queued).toBe(true);
+    const r = (await (await post("unqueue", { resource: "q6", holder: "a" })).json()) as { unqueued: number };
+    expect(r.unqueued).toBe(1);
+    expect((await waiting()).some((w) => w.resource === "q6")).toBe(false);
+    expect((await leases()).some((l) => l.resource === "q6" && l.holder === "a")).toBe(true);
+  });
+
+  test("ten callers queueing at once get positions 1 to 10", async () => {
+    await acquire("q7", "a", "exclusive");
+    const answers = await Promise.all(Array.from({ length: 10 }, (_, i) => wait("q7", `w${i}`, "exclusive").then(refusal)));
+    expect(answers.map((a) => a.position).sort((x, y) => x! - y!)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    expect((await waiting()).filter((w) => w.resource === "q7").map((w) => w.position)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  });
+});
+
 describe("expiry", () => {
   test("a lease stops blocking once its ttl has passed and drops out of the list", async () => {
     await acquire("e1", "a", "exclusive", 1);
@@ -143,6 +225,9 @@ describe("input", () => {
     [{ resource: "r".repeat(501), holder: "a", mode: "shared", ttl_sec: 60 }],
     [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, renew: "yes" }],
     [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, not_after: "soon" }],
+    [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, queue_ttl_sec: 0 }],
+    [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, queue_ttl_sec: 3601 }],
+    [{ resource: "i1", holder: "a", mode: "shared", ttl_sec: 60, queue_ttl_sec: "30" }],
   ])("acquire rejects %j with 400", async (body) => {
     expect((await post("acquire", body)).status).toBe(400);
   });

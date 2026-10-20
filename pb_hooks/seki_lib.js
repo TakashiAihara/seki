@@ -19,7 +19,23 @@ function lease(o) {
   return { resource: o.get("resource"), holder: o.get("holder"), mode: o.get("mode"), host: o.get("host"), why: o.get("why"), expires_at: o.get("expires_at") }
 }
 
+function waiter(o, position) {
+  return { resource: o.get("resource"), holder: o.get("holder"), mode: o.get("mode"), host: o.get("host"), why: o.get("why"), queued_at: o.get("queued_at"), expires_at: o.get("expires_at"), position }
+}
+
+function conflicts(a, b) {
+  return a === "exclusive" || b === "exclusive"
+}
+
+// Whether a waiter ahead in the queue keeps this request out. The same rule as for
+// leases, so a shared request cannot pass an exclusive waiter: a stream of shared
+// holders would otherwise keep the exclusive one waiting forever.
+function blockedByWaiter(mode, aheadMode) {
+  return conflicts(mode, aheadMode)
+}
+
 const MAX_TTL_SEC = 7 * 24 * 3600
+const MAX_QUEUE_TTL_SEC = 3600
 const MAX_TEXT = 500
 
 function text(v, required) {
@@ -32,7 +48,8 @@ function validAcquire(b) {
     (b.mode === "shared" || b.mode === "exclusive") &&
     (b.renew === undefined || typeof b.renew === "boolean") &&
     (b.not_after === undefined || Number.isInteger(b.not_after)) &&
+    (b.queue_ttl_sec === undefined || (Number.isInteger(b.queue_ttl_sec) && b.queue_ttl_sec >= 1 && b.queue_ttl_sec <= MAX_QUEUE_TTL_SEC)) &&
     Number.isInteger(b.ttl_sec) && b.ttl_sec >= 1 && b.ttl_sec <= MAX_TTL_SEC
 }
 
-module.exports = { authorize, lease, validAcquire }
+module.exports = { authorize, lease, waiter, conflicts, blockedByWaiter, validAcquire }
