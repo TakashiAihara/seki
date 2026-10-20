@@ -646,6 +646,7 @@ describe("--wait", () => {
     const r = await seki(["acquire", "w2", "--exclusive", "--wait", "3s"], { SEKI_HOLDER: "next" });
     expect(r.code).toBe(1);
     expect(performance.now() - started).toBeGreaterThan(1500);
+    expect(performance.now() - started).toBeLessThan(8000);
     expect(r.err).toContain("owner");
     expect(await waitingFor("w2")).toEqual([]);
   });
@@ -655,6 +656,7 @@ describe("--wait", () => {
     await seki(["acquire", "w3", "--shared"], { SEKI_HOLDER: "b" });
     expect((await seki(["acquire", "w3", "--exclusive", "--wait", "2s"], { SEKI_HOLDER: "a" })).code).toBe(1);
     expect((await ls()).find((x) => x.resource === "w3" && x.holder === "a")?.mode).toBe("shared");
+    expect(await waitingFor("w3")).toEqual([]);
   });
 
   test("a request without --wait does not jump the queue", async () => {
@@ -662,10 +664,13 @@ describe("--wait", () => {
     const waiting = seki(["acquire", "w4", "--exclusive", "--wait", "30s"], { SEKI_HOLDER: "next" });
     await untilQueued("w4", 1);
     await seki(["release", "w4"], { SEKI_HOLDER: "owner" });
+    // The waiter may already hold it by now, or still be waiting ahead: either way the cutter is
+    // refused because of it. The server test pins the case where the cutter comes first.
     const cut = await seki(["acquire", "w4", "--exclusive"], { SEKI_HOLDER: "cutter" });
     expect(cut.code).toBe(1);
-    expect(cut.err).toContain("1. exclusive by next");
+    expect(cut.err).toContain("exclusive by next");
     expect((await waiting).code).toBe(0);
+    expect((await ls()).find((x) => x.resource === "w4")?.holder).toBe("next");
   });
 
   test("runs waiting for one resource start in the order they queued", async () => {
@@ -675,7 +680,7 @@ describe("--wait", () => {
     await untilQueued("w5", 1);
     const second = seki(["run", "w5", "--exclusive", "--wait", "30s", "--", "sh", "-c", `echo second >> ${log}`], { SEKI_HOLDER: "two" });
     await untilQueued("w5", 2);
-    expect((await waitingFor("w5")).map((w) => w.position)).toEqual([1, 2]);
+    expect((await waitingFor("w5")).map((w) => [w.holder.split("#")[0], w.position])).toEqual([["one", 1], ["two", 2]]);
     await seki(["release", "w5"], { SEKI_HOLDER: "owner" });
     expect((await first).code).toBe(0);
     expect((await second).code).toBe(0);
@@ -700,6 +705,32 @@ describe("--wait", () => {
     expect(lines).toContainEqual(expect.stringMatching(/^w7\s+1\s+shared\s+hana\s+\S+\s+for \d+m\s+eval run$/));
     await seki(["release", "w7"], { SEKI_HOLDER: "owner" });
     expect((await waiting).code).toBe(0);
+  });
+
+  test("a poll that cannot reach the server is retried; the wait goes on", async () => {
+    await seki(["acquire", "w9", "--exclusive"], { SEKI_HOLDER: "owner" });
+    let acquires = 0;
+    // The second acquire hangs past SEKI_TIMEOUT_MS, so the client sees it as unreachable.
+    const proxy = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(req) {
+        const u = new URL(req.url);
+        const body = req.method === "POST" ? await req.text() : undefined;
+        if (u.pathname === "/api/seki/acquire" && ++acquires === 2) await Bun.sleep(1500);
+        return fetch(s.url + u.pathname + u.search, { method: req.method, headers: req.headers, body });
+      },
+    });
+    try {
+      const waiting = seki(["acquire", "w9", "--exclusive", "--wait", "30s"], { SEKI_HOLDER: "next", SEKI_URL: `http://127.0.0.1:${proxy.port}`, SEKI_TIMEOUT_MS: "500" });
+      while (acquires < 3) await Bun.sleep(100);
+      await seki(["release", "w9"], { SEKI_HOLDER: "owner" });
+      const r = await waiting;
+      expect(r.code).toBe(0);
+      expect(r.err).toContain("asking again");
+    } finally {
+      proxy.stop(true);
+    }
   });
 
   test.each(["0", "0s", "169h", "soon"])("--wait %s is a usage error", async (v) => {

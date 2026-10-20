@@ -168,6 +168,23 @@ describe("queue", () => {
     expect((await post("acquire", { resource: "q4", holder: "a", mode: "exclusive", ttl_sec: 60, renew: true })).status).toBe(200);
   });
 
+  test("a renew of a lapsed lease is refused with 410 while others wait", async () => {
+    await acquire("q8", "a", "exclusive", 1);
+    await wait("q8", "c", "exclusive");
+    await Bun.sleep(1500);
+    expect((await post("acquire", { resource: "q8", holder: "a", mode: "exclusive", ttl_sec: 60, renew: true })).status).toBe(410);
+  });
+
+  test("moving a shared lease to exclusive waits behind an exclusive waiter that came first", async () => {
+    await acquire("q9", "a", "shared");
+    await wait("q9", "x", "exclusive");
+    const up = await refusal(await wait("q9", "a", "exclusive"));
+    expect(up.waiting.map((w) => w.holder)).toEqual(["x"]);
+    expect(up.position).toBe(2);
+    expect((await acquire("q9", "a", "shared")).status).toBe(200);
+    expect((await waiting()).filter((w) => w.resource === "q9").map((w) => w.holder)).toEqual(["x", "a"]);
+  });
+
   test("a waiter that stops asking falls out of the queue after its queue_ttl_sec", async () => {
     await acquire("q5", "a", "exclusive");
     await wait("q5", "b", "exclusive", 1);
@@ -192,7 +209,9 @@ describe("queue", () => {
     await acquire("q7", "a", "exclusive");
     const answers = await Promise.all(Array.from({ length: 10 }, (_, i) => wait("q7", `w${i}`, "exclusive").then(refusal)));
     expect(answers.map((a) => a.position).sort((x, y) => x! - y!)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    expect((await waiting()).filter((w) => w.resource === "q7").map((w) => w.position)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    // Each caller's place as acquire told it matches its place in the list.
+    const told = answers.map((a, i): [string, number] => [`w${i}`, a.position!]).sort((x, y) => x[1] - y[1]);
+    expect((await waiting()).filter((w) => w.resource === "q7").map((w) => [w.holder, w.position])).toEqual(told);
   });
 });
 

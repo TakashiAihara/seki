@@ -32,6 +32,12 @@ class Failure extends Error {
   }
 }
 
+class Unreachable extends Failure {
+  constructor(message: string) {
+    super(2, message);
+  }
+}
+
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -139,7 +145,7 @@ async function call(cfg: Config, method: "GET" | "POST", path: string, body?: un
     });
     return { status: res.status, text: await res.text() };
   } catch (e) {
-    throw new Failure(2, `server unreachable at ${cfg.url}: ${errText(e)}`);
+    throw new Unreachable(`server unreachable at ${cfg.url}: ${errText(e)}`);
   }
 }
 
@@ -202,10 +208,11 @@ async function unqueue(cfg: Config, resource: string, holder: string): Promise<v
 
 const POLL_MS = 1000;
 
-// How long the server keeps a waiter that stops asking. Longer than one poll can take
-// (SEKI_TIMEOUT_MS), so a slow answer does not cost the place in the queue.
+// How long the server keeps a waiter that stops asking. Two refreshes the server sees can be
+// up to 2 × SEKI_TIMEOUT_MS + POLL_MS apart (an answer that takes the whole timeout, the
+// sleep, then a request that does too), so slow answers do not cost the place in the queue.
 function queueTtlSec(): number {
-  return Math.min(3600, Math.ceil((timeoutMs + POLL_MS) / 1000) + 20);
+  return Math.min(3600, Math.ceil((2 * timeoutMs + POLL_MS) / 1000) + 20);
 }
 
 // With waitMs > 0 a refused request is queued and asked again every POLL_MS, keeping its
@@ -222,9 +229,19 @@ async function acquireWaiting(cfg: Config, body: AcquireBody, waitMs: number): P
   try {
     for (;;) {
       const sentAt = performance.now();
-      const result = await acquire(cfg, queued);
+      let result: AcquireResult;
+      try {
+        result = await acquire(cfg, queued);
+      } catch (e) {
+        // A wait can last hours; one dropped connection should not end it. Other failures
+        // (token, clock, server errors) would fail every time and end it at once.
+        if (!(e instanceof Unreachable) || performance.now() >= until) throw e;
+        console.error(`warning: ${e.message}; asking again`);
+        await Bun.sleep(Math.min(POLL_MS, until - performance.now()));
+        continue;
+      }
       if (!("heldBy" in result)) return { result, sentAt };
-      if (performance.now() + POLL_MS >= until) {
+      if (performance.now() >= until) {
         await unqueue(cfg, body.resource, body.holder);
         return { result, sentAt };
       }
@@ -232,7 +249,7 @@ async function acquireWaiting(cfg: Config, body: AcquireBody, waitMs: number): P
         shown = result.position;
         console.error(`seki: waiting for ${body.resource}: number ${shown} in the queue`);
       }
-      await Bun.sleep(POLL_MS);
+      await Bun.sleep(Math.min(POLL_MS, until - performance.now()));
     }
   } catch (e) {
     await unqueue(cfg, body.resource, body.holder);

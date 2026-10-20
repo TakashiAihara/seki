@@ -39,12 +39,15 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     const mine = tx.findRecordsByFilter("leases", "resource = {:r} && holder = {:h}", "", 1, 0, { r: b.resource, h: b.holder })
     const renewed = mine.length > 0
 
-    // A holder renewing is ahead of everyone waiting. Anyone else comes after the waiters
-    // queued before it; a request that does not queue comes after all of them, so it cannot
-    // take the resource from under the queue the moment it frees up.
+    // A holder renewing is ahead of everyone waiting; moving a shared lease to exclusive is
+    // not a renew and waits its turn. Anyone else comes after the waiters queued before it; a
+    // request that does not queue comes after all of them, so it cannot take the resource from
+    // under the queue the moment it frees up (it still goes in with shared waiters when it is
+    // shared too). A renew (renew: true) never queues: a lapsed one gets 410 below.
+    const keeping = renewed && !(b.mode === "exclusive" && mine[0].get("mode") === "shared")
     const queue = tx.findRecordsByFilter("waiters", "resource = {:r}", "queued_at,id", 0, 0, { r: b.resource })
     const at = queue.findIndex((w) => w.get("holder") === b.holder)
-    const ahead = renewed ? [] : at < 0 ? queue : queue.slice(0, at)
+    const ahead = keeping || b.renew === true ? [] : at < 0 ? queue : queue.slice(0, at)
     const waitingFor = ahead.filter((w) => seki.blockedByWaiter(b.mode, w.get("mode")))
 
     if (blocking.length > 0 || waitingFor.length > 0) {
@@ -54,7 +57,8 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
         if (at < 0) {
           w.set("resource", b.resource)
           w.set("holder", b.holder)
-          w.set("queued_at", now)
+          // Strictly after the last waiter, so two arriving in the same millisecond keep their order.
+          w.set("queued_at", queue.length > 0 ? Math.max(now, queue[queue.length - 1].get("queued_at") + 1) : now)
         }
         w.set("mode", b.mode)
         w.set("host", b.host || "")
@@ -80,8 +84,9 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     rec.set("why", b.why || "")
     rec.set("expires_at", now + b.ttl_sec * 1000)
     tx.save(rec)
-    if (at >= 0) tx.delete(queue[at])
-    res ={ status: 200, body: { ok: true, renewed, lease: seki.lease(rec) } }
+    // A holder renewing its shared lease while it waits to go exclusive stays in the queue.
+    if (at >= 0 && queue[at].get("mode") === b.mode) tx.delete(queue[at])
+    res = { status: 200, body: { ok: true, renewed, lease: seki.lease(rec) } }
   })
   return e.json(res.status, res.body)
 })
