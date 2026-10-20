@@ -723,7 +723,7 @@ describe("--wait", () => {
     });
     try {
       const waiting = seki(["acquire", "w9", "--exclusive", "--wait", "30s"], { SEKI_HOLDER: "next", SEKI_URL: `http://127.0.0.1:${proxy.port}`, SEKI_TIMEOUT_MS: "500" });
-      while (acquires < 3) await Bun.sleep(100);
+      for (let i = 0; i < 100 && acquires < 3; i++) await Bun.sleep(100);
       await seki(["release", "w9"], { SEKI_HOLDER: "owner" });
       const r = await waiting;
       expect(r.code).toBe(0);
@@ -733,8 +733,9 @@ describe("--wait", () => {
     }
   });
 
-  test("a gateway error while waiting is retried too", async () => {
-    await seki(["acquire", "w10", "--exclusive"], { SEKI_HOLDER: "owner" });
+  test.each([502, 504])("a gateway error (%d) while waiting is retried too", async (status) => {
+    const res = `w10-${status}`;
+    await seki(["acquire", res, "--exclusive"], { SEKI_HOLDER: "owner" });
     let acquires = 0;
     const proxy = Bun.serve({
       hostname: "127.0.0.1",
@@ -742,17 +743,17 @@ describe("--wait", () => {
       async fetch(req) {
         const u = new URL(req.url);
         const body = req.method === "POST" ? await req.text() : undefined;
-        if (u.pathname === "/api/seki/acquire" && ++acquires === 2) return new Response("bad gateway", { status: 502 });
+        if (u.pathname === "/api/seki/acquire" && ++acquires === 2) return new Response("gateway", { status });
         return fetch(s.url + u.pathname + u.search, { method: req.method, headers: req.headers, body });
       },
     });
     try {
-      const waiting = seki(["acquire", "w10", "--exclusive", "--wait", "30s"], { SEKI_HOLDER: "next", SEKI_URL: `http://127.0.0.1:${proxy.port}` });
-      while (acquires < 3) await Bun.sleep(100);
-      await seki(["release", "w10"], { SEKI_HOLDER: "owner" });
+      const waiting = seki(["acquire", res, "--exclusive", "--wait", "30s"], { SEKI_HOLDER: "next", SEKI_URL: `http://127.0.0.1:${proxy.port}` });
+      for (let i = 0; i < 100 && acquires < 3; i++) await Bun.sleep(100);
+      await seki(["release", res], { SEKI_HOLDER: "owner" });
       const r = await waiting;
       expect(r.code).toBe(0);
-      expect(r.err).toContain("502");
+      expect(r.err).toContain(`server returned ${status}`);
     } finally {
       proxy.stop(true);
     }

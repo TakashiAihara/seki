@@ -190,6 +190,31 @@ describe("queue", () => {
     expect((await waiting()).filter((w) => w.resource === "q10").map((w) => w.holder)).toEqual(["a"]);
   });
 
+  test("a holder waiting to move to exclusive is shown at the front of the queue", async () => {
+    await acquire("q12", "a", "shared");
+    await acquire("q12", "b", "shared");
+    await wait("q12", "x", "exclusive");
+    const up = await refusal(await wait("q12", "a", "exclusive"));
+    expect(up.position).toBe(1);
+    expect((await waiting()).filter((w) => w.resource === "q12").map((w) => [w.holder, w.position])).toEqual([["a", 1], ["x", 2]]);
+  });
+
+  test("a waiter that takes the resource in another mode than it queued with leaves the queue", async () => {
+    await acquire("q13", "a", "exclusive");
+    await wait("q13", "c", "exclusive");
+    await post("release", { resource: "q13", holder: "a" });
+    expect((await wait("q13", "c", "shared")).status).toBe(200);
+    expect((await waiting()).some((w) => w.resource === "q13")).toBe(false);
+  });
+
+  test("a renew never joins the queue, even with queue_ttl_sec", async () => {
+    await acquire("q11", "a", "shared");
+    await acquire("q11", "b", "shared");
+    const r = await refusal(await post("acquire", { resource: "q11", holder: "a", mode: "exclusive", ttl_sec: 60, renew: true, queue_ttl_sec: 60 }));
+    expect(r.queued).toBe(false);
+    expect((await waiting()).some((w) => w.resource === "q11")).toBe(false);
+  });
+
   test("a waiter that stops asking falls out of the queue after its queue_ttl_sec", async () => {
     await acquire("q5", "a", "exclusive");
     await wait("q5", "b", "exclusive", 1);

@@ -58,7 +58,10 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
           w.set("resource", b.resource)
           w.set("holder", b.holder)
           // Strictly after the last waiter, so two arriving in the same millisecond keep their order.
-          w.set("queued_at", queue.length > 0 ? Math.max(now, queue[queue.length - 1].get("queued_at") + 1) : now)
+          // A holder goes ahead of the queue, so its place is shown at the front.
+          const last = queue.length > 0 ? queue[queue.length - 1].get("queued_at") : now - 1
+          const first = queue.length > 0 ? queue[0].get("queued_at") : now + 1
+          w.set("queued_at", renewed ? Math.min(now, first - 1) : Math.max(now, last + 1))
         }
         w.set("mode", b.mode)
         w.set("host", b.host || "")
@@ -66,7 +69,7 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
         w.set("expires_at", now + b.queue_ttl_sec * 1000)
         tx.save(w)
         body.queued = true
-        body.position = (at < 0 ? queue.length : at) + 1
+        body.position = at >= 0 ? at + 1 : renewed ? 1 : queue.length + 1
       }
       res = { status: 409, body }
       return
@@ -85,7 +88,7 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     rec.set("expires_at", now + b.ttl_sec * 1000)
     tx.save(rec)
     // A holder renewing its shared lease while it waits to go exclusive stays in the queue.
-    if (at >= 0 && queue[at].get("mode") === b.mode) tx.delete(queue[at])
+    if (at >= 0 && !(renewed && queue[at].get("mode") !== b.mode)) tx.delete(queue[at])
     res = { status: 200, body: { ok: true, renewed, lease: seki.lease(rec) } }
   })
   return e.json(res.status, res.body)
