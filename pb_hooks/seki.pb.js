@@ -53,7 +53,9 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     const waitingFor = ahead.filter((w) => seki.blockedByWaiter(b.mode, w.get("mode")))
 
     if (blocking.length > 0 || waitingFor.length > 0) {
-      const body = { ok: false, held_by: blocking.map(seki.lease), waiting: ahead.map((w, i) => seki.waiter(w, i + 1)), queued: false }
+      // A holder skips the queue, yet is told who is listed before it, matching its position.
+      const listed = renewed ? (at >= 0 ? queue.slice(0, at) : queue.filter((q) => holders.indexOf(q.get("holder")) >= 0)) : ahead
+      const body = { ok: false, held_by: blocking.map(seki.lease), waiting: listed.map((w, i) => seki.waiter(w, i + 1)), queued: false }
       if (b.queue_ttl_sec !== undefined && b.renew !== true) {
         const w = at >= 0 ? queue[at] : new Record(tx.findCollectionByNameOrId("waiters"))
         if (at < 0) {

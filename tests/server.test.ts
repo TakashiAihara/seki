@@ -232,6 +232,11 @@ describe("queue", () => {
     expect(x.position).toBe(3);
     expect(x.waiting.map((w) => w.holder)).toEqual(["a", "b"]);
     expect((await waiting()).filter((w) => w.resource === "q16").map((w) => [w.holder, w.position])).toEqual([["a", 1], ["b", 2], ["x", 3]]);
+    // Asking again keeps each holder's place, and it is told who is listed before it.
+    const b = await refusal(await wait("q16", "b", "exclusive"));
+    expect(b.position).toBe(2);
+    expect(b.waiting.map((w) => [w.holder, w.position])).toEqual([["a", 1]]);
+    expect((await refusal(await wait("q16", "a", "exclusive"))).position).toBe(1);
   });
 
   test("ls numbers each resource's queue on its own, holders first in each", async () => {
