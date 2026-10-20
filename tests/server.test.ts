@@ -136,6 +136,22 @@ describe("queue", () => {
     expect((await acquire("q4", "a")).status).toBe(200);
   });
 
+  test("co-holders left from shared leases can each renew, and keep everyone else out", async () => {
+    // Such rows can no longer be made through acquire, so the second one is written as a superuser.
+    const email = ["co-holders", "example.com"].join("@");
+    const pw = "pw-" + crypto.randomUUID();
+    expect(await Bun.spawn([s.binary, "superuser", "upsert", email, pw, "--dir", s.dataDir], { stdout: "ignore", stderr: "ignore" }).exited).toBe(0);
+    const auth = await fetch(`${s.url}/api/collections/_superusers/auth-with-password`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ identity: email, password: pw }) });
+    const token = ((await auth.json()) as { token: string }).token;
+    await acquire("q13", "a");
+    const row = await fetch(`${s.url}/api/collections/leases/records`, { method: "POST", headers: { "content-type": "application/json", Authorization: token }, body: JSON.stringify({ resource: "q13", holder: "b", expires_at: Date.now() + 60_000 }) });
+    expect(row.status).toBe(200);
+
+    expect((await post("acquire", { resource: "q13", holder: "a", ttl_sec: 60, renew: true })).status).toBe(200);
+    expect((await acquire("q13", "b")).status).toBe(200);
+    expect((await acquire("q13", "c")).status).toBe(409);
+  });
+
   test("a renew of a lapsed lease is refused with 410 while others wait", async () => {
     await acquire("q8", "a", 1);
     await wait("q8", "c");
