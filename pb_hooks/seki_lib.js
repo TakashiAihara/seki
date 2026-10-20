@@ -35,7 +35,7 @@ function blockedByWaiter(mode, aheadMode) {
 }
 
 // The order a resource's queue is served in. A waiter that already holds a lease on it (one
-// moving shared to exclusive) goes first, since the others need it to let go anyway; the rest
+// moving shared to exclusive) goes first (see acquire for why); the rest
 // keep arrival order. acquire and the list both use this, so the place a caller is told is the
 // place ls shows. For waiters that hold nothing it is also the order they are served in; holders
 // are served as soon as the other leases are gone, whatever their place among themselves.

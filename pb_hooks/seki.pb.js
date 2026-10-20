@@ -40,7 +40,8 @@ routerAdd("POST", "/api/seki/acquire", (e) => {
     const renewed = mine.length > 0
 
     // A holder is ahead of everyone waiting, also when it moves its shared lease to exclusive:
-    // the waiters need it to let go anyway, so making it wait for them would leave both waiting.
+    // exclusive waiters need it to let go anyway, so making it wait for them would leave both
+    // waiting, and shared ones let past it could keep it from ever going exclusive.
     // Anyone else comes after the waiters ahead of it in queueOrder; a request that does not queue
     // comes after all of them, so it cannot take the resource from under the queue the moment it
     // frees up (it still goes in with shared waiters when it is shared too). A renew (renew: true)
